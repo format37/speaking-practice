@@ -145,28 +145,63 @@ def _iter_json_objects(text: str):
                 yield text[start:i + 1]
 
 
-def _parse_result(content: str) -> ReviewResult:
-    """Parse a model reply into a :class:`ReviewResult`, scanning for braces."""
+_FENCE_RE = re.compile(r"```(?:json)?", re.IGNORECASE)
+
+
+def _coerce_review(obj):
+    """Validate a dict/list into a ReviewResult; return None on failure.
+
+    Accepts the canonical ``{"items": [...]}`` object, a bare list of items,
+    or a single item object.
+    """
     try:
-        return ReviewResult.model_validate_json(content)
-    except Exception:
-        pass
-    try:
-        obj = json.loads(content)
+        if isinstance(obj, list):
+            return ReviewResult.model_validate({"items": obj})
         if isinstance(obj, dict):
-            return ReviewResult.model_validate(obj)
+            if "items" in obj:
+                return ReviewResult.model_validate(obj)
+            if "id" in obj and "keep" in obj:
+                return ReviewResult.model_validate({"items": [obj]})
+    except Exception:
+        return None
+    return None
+
+
+def _parse_result(content: str) -> ReviewResult:
+    """Parse a model reply into a :class:`ReviewResult`, tolerant of prose,
+    markdown code fences, a bare ``[...]`` array, or a truncated reply (from which
+    whatever complete item-objects exist are still recovered)."""
+    text = _FENCE_RE.sub("", content or "").strip()
+    # 1) whole reply as JSON (object or array)
+    try:
+        r = _coerce_review(json.loads(text))
+        if r is not None:
+            return r
     except Exception:
         pass
-    for candidate in _iter_json_objects(content):
+    # 2) pydantic's own JSON parse
+    try:
+        return ReviewResult.model_validate_json(text)
+    except Exception:
+        pass
+    # 3) scan balanced {...}: prefer an object with "items"; otherwise assemble
+    #    the individual item-objects found (recovers partial/truncated replies).
+    items = []
+    for candidate in _iter_json_objects(text):
         try:
             obj = json.loads(candidate)
         except json.JSONDecodeError:
             continue
         if isinstance(obj, dict) and "items" in obj:
-            try:
-                return ReviewResult.model_validate(obj)
-            except Exception:
-                continue
+            r = _coerce_review(obj)
+            if r is not None:
+                return r
+        elif isinstance(obj, dict) and "id" in obj and "keep" in obj:
+            items.append(obj)
+    if items:
+        r = _coerce_review(items)
+        if r is not None:
+            return r
     raise ValueError("No valid ReviewResult JSON found in model output")
 
 
@@ -455,6 +490,9 @@ def review_errors(
         used_model = model or config.OPENAI_MODEL
     else:
         used_model = model or getattr(config, "CLAUDE_REVIEW_MODEL", None)
+        # The Agent SDK returns free text (no strict schema); smaller batches keep
+        # each JSON reply short and reliable to parse.
+        batch_size = min(batch_size, 30)
 
     # ----- per-item cache: reuse known verdicts, query only the rest -------
     cache_tag = f"{backend}:{used_model or 'default'}"
@@ -551,10 +589,11 @@ def review_errors(
                 by_sig[sig_by_id[rid]] = v
             new_count += 1
 
-        # Persist after EACH batch so an interruption (quota/network) still saves
-        # progress; the next run resumes instead of re-paying for everything.
+        # Persist after EACH batch so an interruption (quota/rate limit/network)
+        # still saves progress; the next run resumes instead of starting over.
+        # NOTE: must use the SAME cache_tag the load used, or every load misses.
         if cache_path is not None and by_sig:
-            _save_cache(Path(cache_path), used_model, by_sig)
+            _save_cache(Path(cache_path), cache_tag, by_sig)
 
     print(
         f"review: obtained {len(verdicts)} verdicts "
