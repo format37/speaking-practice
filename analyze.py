@@ -1,11 +1,15 @@
 """Compare a read-aloud transcript against the original book chapter.
 
 Produces per-session CSV reports and PNG diagrams plus cumulative cross-session
-progress, telling a non-native English speaker which words/sounds to drill and
-how their fluency is progressing.
+progress, telling a learner which words/sounds to drill and how their fluency is
+progressing. Language-specific behaviour (normalization, tokenization, ending /
+mispronunciation / sound-group classification, word- vs character-level rate) is
+delegated entirely to a LanguageProfile from ``languages.get_profile()``; this
+module owns only the language-agnostic alignment, metrics, CSV and plotting.
 
 Usage:
     python analyze.py "1.1 JUST A BARREL OF MONKEYS"
+    python analyze.py "1.1 ..." --language en
     python analyze.py "1.1 ..." --reference ref.txt --transcript hyp.json \\
         --label custom --no-progress
 """
@@ -24,6 +28,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 import config
+import languages
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -31,19 +36,6 @@ import config
 LOW_CONF = 0.6
 PAUSE_GAP = 0.5            # seconds: gap > this is counted as a pause
 HESITATION_GAP = 1.0
-COMFORT_LOW, COMFORT_HIGH = 100, 130    # learner read-aloud comfortable band
-
-INFLECTIONAL_SUFFIXES = {
-    "s", "es", "ed", "d", "ing", "en", "er", "est",
-    "ies", "ier", "iest", "ly", "'s", "'ll", "'d", "'ve", "'re", "n't",
-}
-CONFUSABLES = {
-    frozenset({"their", "there", "theyre", "they're"}),
-    frozenset({"to", "too", "two"}),
-    frozenset({"of", "off"}),
-    frozenset({"then", "than"}),
-    frozenset({"your", "youre", "you're"}),
-}
 
 # error categories
 CORRECT = "correct"
@@ -55,17 +47,8 @@ MISP = "mispronunciation"
 SUBST = "substitution"
 ERROR_CATEGORIES = [OMISSION, INSERTION, REPETITION, ENDING, MISP, SUBST]
 
-# Russian-L1 phoneme groups (regex on normalized word)
-PHONEME_GROUPS = [
-    ("th", re.compile(r"th")),
-    ("w_v", re.compile(r"[wv]")),
-    ("r", re.compile(r"r$|[aeiou]r")),
-    ("final_voiced", re.compile(r"[bdgvz]$")),
-    ("final_cluster", re.compile(r"[bcdfghjklmnpqrstvwxz]{2}$")),
-    ("h_x", re.compile(r"h[aeiou]")),
-    ("ng", re.compile(r"ng$|nk")),
-    ("vowel_len", re.compile(r"ee|oo")),
-]
+# Notes shown alongside flagged sound groups. The profile decides which group
+# keys exist (empty for non-English); keys we do not know simply get no note.
 PHONEME_NOTES = {
     "th": "th -> tongue between teeth, not /s/ or /z/",
     "w_v": "w -> round lips (no teeth); v -> teeth on lip",
@@ -86,13 +69,16 @@ ERROR_NOTE = {
     REPETITION: "stutter/re-read - aim for a smooth first take",
 }
 
+# Language-agnostic cumulative schema. The `language` column lets the same
+# chapter be tracked in several languages; sound-group rates are NOT stored here
+# (the EN progress chart re-reads each session's phoneme_groups.csv instead).
 SESSION_COLUMNS = [
-    "date", "chapter", "n_ref_words", "accuracy", "wer",
+    "date", "chapter", "language", "n_ref_units", "accuracy", "wer",
     "omissions", "insertions", "repetitions", "ending_mixups",
     "mispronunciations", "substitutions",
-    "overall_wpm", "articulation_rate", "mean_confidence",
+    "overall_rate", "articulation_rate", "mean_confidence",
     "n_pauses", "duration_min",
-] + [f"err_rate_{g}" for g, _ in PHONEME_GROUPS]
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -104,46 +90,62 @@ def slug(label):
 
 
 # --------------------------------------------------------------------------- #
-# Normalization & tokenization
+# Reference / transcript loading (profile-driven)
 # --------------------------------------------------------------------------- #
-_CURLY = str.maketrans({"‘": "'", "’": "'", "“": '"',
-                        "”": '"', "–": "-", "—": "-"})
+_SENTENCE_END = (".", "?", "!")
 
 
-def normalize_word(raw):
-    """Return list of normalized tokens for a single raw display token.
-
-    Lowercases, fixes curly quotes, splits hyphen/slash compounds, keeps
-    intra-word apostrophes, strips other punctuation, drops empties.
-    """
-    w = raw.translate(_CURLY).lower()
-    parts = re.split(r"[-/]+", w)
-    out = []
-    for p in parts:
-        p = re.sub(r"[^a-z0-9']", "", p)   # strip punctuation, keep apostrophe
-        p = p.strip("'")                    # leading/trailing apostrophes
-        if p:
-            out.append(p)
-    return out
+def _strip_leading_nonalnum(s):
+    """Drop leading quotes/parens etc. so the first *letter* is tested."""
+    i = 0
+    while i < len(s) and not s[i].isalnum():
+        i += 1
+    return s[i:]
 
 
-def tokenize_text(text):
+def tokenize_text(profile, text):
     """Tokenize plain text -> parallel arrays (norm, display, start, end, conf).
 
-    start/end/conf are None for reference text. Splitting compounds keeps the
-    norm and display arrays the same length so opcode indices stay aligned.
+    Uses ``profile.normalize`` per display token and ``profile.tokenize`` is not
+    used here directly because we must keep the norm and display arrays the same
+    length (one display token -> its norm tokens) so opcode indices stay aligned.
+    For the char profile, ``normalize`` of a whitespace-delimited token still
+    yields per-character norms via the same loop. start/end/conf are None for
+    reference text.
     """
     norm, disp = [], []
+    char_unit = profile.unit == "char"
     for raw in text.split():
-        for n in normalize_word(raw):
+        for n in _normalize_parts(profile, raw):
             norm.append(n)
-            disp.append(raw)
+            disp.append(n if char_unit else raw)
     none = [None] * len(norm)
     return norm, disp, list(none), list(none), list(none)
 
 
-def load_reference(path):
-    """Read reference chapter, drop the title (first non-empty line) from body."""
+def _normalize_parts(profile, raw):
+    """Return the list of normalized tokens a single raw display token yields.
+
+    ``profile.normalize`` returns a single normalized string for a word-unit
+    profile, or — for compound splitting / char profiles — we expand through the
+    profile's tokenizer so e.g. hyphen compounds (en) and per-char (ja) both
+    produce the right parallel-array length. We call ``profile.tokenize`` on the
+    single raw token to obtain its normalized pieces.
+    """
+    return profile.tokenize(raw)
+
+
+def load_reference(profile, path):
+    """Read reference chapter, drop the title, flag proper nouns.
+
+    Returns (title, ref_arrays, body) where ref_arrays is
+    (norm, disp, start, end, conf, is_proper). Proper-noun flagging only happens
+    when ``profile.detect_proper_nouns``: a token is proper iff its first letter
+    (after stripping leading quotes/parens) is uppercase AND it is not
+    sentence-initial (first body token, or following a token ending in .?! or a
+    paragraph break). The flag is replicated to every normalized piece of a split
+    compound so it survives tokenization.
+    """
     if not path.exists():
         sys.exit(f"ERROR: reference file not found: {path}")
     raw = path.read_text(encoding="utf-8", errors="replace")
@@ -156,8 +158,25 @@ def load_reference(path):
             continue
         body_lines.append(ln)
     body = "\n".join(body_lines).strip() or raw  # fallback if only one line
-    norm, disp, s, e, c = tokenize_text(body)
-    return title, (norm, disp, s, e, c), body
+
+    norm, disp, propers = [], [], []
+    sentence_start = True
+    for para in body.split("\n\n"):
+        sentence_start = True            # paragraph break resets the flag
+        for raw_tok in para.split():
+            stripped = _strip_leading_nonalnum(raw_tok)
+            is_proper = bool(
+                profile.detect_proper_nouns and stripped
+                and stripped[0].isupper() and not sentence_start)
+            char_unit = profile.unit == "char"
+            for n in _normalize_parts(profile, raw_tok):
+                norm.append(n)
+                disp.append(n if char_unit else raw_tok)
+                propers.append(is_proper)
+            sentence_start = raw_tok.rstrip("\"')]").endswith(_SENTENCE_END)
+    none = [None] * len(norm)
+    ref = (norm, disp, list(none), list(none), list(none), propers)
+    return title, ref, body
 
 
 def _extract_words(data):
@@ -182,8 +201,13 @@ def _extract_words(data):
     return None
 
 
-def load_transcript(path):
-    """Load transcript json -> parallel arrays with timing & confidence."""
+def load_transcript(profile, path):
+    """Load transcript json -> parallel arrays with timing & confidence.
+
+    Delegates the word/char split to ``profile.split_hypothesis`` so that
+    char-unit profiles explode each Deepgram word into its significant chars,
+    all sharing that word's start/end/confidence.
+    """
     if not path.exists():
         sys.exit(f"ERROR: transcript file not found: {path}")
     try:
@@ -194,17 +218,12 @@ def load_transcript(path):
     if words is None:
         sys.exit(f"ERROR: no words[] found in transcript {path}")
     norm, disp, starts, ends, confs = [], [], [], [], []
-    for w in words:
-        raw = (w.get("punctuated_word") or w.get("word") or "")
-        st = w.get("start")
-        en = w.get("end")
-        cf = w.get("confidence")
-        for n in normalize_word(str(raw)):
-            norm.append(n)
-            disp.append(str(raw))
-            starts.append(st)
-            ends.append(en)
-            confs.append(cf)
+    for unit in profile.split_hypothesis(words):
+        norm.append(unit["norm"])
+        disp.append(unit["display"])
+        starts.append(unit["start"])
+        ends.append(unit["end"])
+        confs.append(unit["conf"])
     return norm, disp, starts, ends, confs
 
 
@@ -233,68 +252,15 @@ def resolve_transcript_path(args, label):
 
 
 # --------------------------------------------------------------------------- #
-# Classification helpers
-# --------------------------------------------------------------------------- #
-def common_prefix_len(a, b):
-    n = 0
-    for x, y in zip(a, b):
-        if x != y:
-            break
-        n += 1
-    return n
-
-
-def is_ending_mixup(a, b):
-    """True when a/b share a stem and differ only by inflectional suffixes."""
-    if a == b:
-        return False
-    cp = common_prefix_len(a, b)
-    if cp < 3:
-        return False
-    ta, tb = a[cp:], b[cp:]
-    if ta == tb:
-        return False
-    ta_ok = (ta == "") or (ta in INFLECTIONAL_SUFFIXES)
-    tb_ok = (tb == "") or (tb in INFLECTIONAL_SUFFIXES)
-    return ta_ok and tb_ok
-
-
-def both_in_confusable(a, b):
-    sa = a.replace("'", "")
-    sb = b.replace("'", "")
-    for grp in CONFUSABLES:
-        cg = {x.replace("'", "") for x in grp}
-        if sa in cg and sb in cg:
-            return True
-    return False
-
-
-def classify_replace_pair(a, b):
-    """Classify a ref/hyp replace pair into ending/misp/subst."""
-    if both_in_confusable(a, b):
-        return MISP
-    if is_ending_mixup(a, b):
-        return ENDING
-    ratio = SequenceMatcher(None, a, b).ratio()
-    minlen = min(len(a), len(b))
-    if ratio >= 0.65 and minlen >= 4:
-        return MISP
-    return SUBST
-
-
-# --------------------------------------------------------------------------- #
 # Alignment & classification
 # --------------------------------------------------------------------------- #
 def collapse_stutters(hyp):
     """Collapse immediate duplicate hyp tokens (stutters) before alignment.
 
-    Returns (clean_hyp, repetition_items). A stutter is a hyp token that is
+    Returns (clean_hyp, keep_idx, repetition_items). A stutter is a hyp token
     equal to, or a >=2-char prefix of, the immediately following hyp token
-    ("the the", "c- cat"). Such tokens are removed from the stream used for
-    alignment and recorded directly as REPETITION items, so they cannot
-    pollute the difflib opcodes (which otherwise emit the duplicate as an
-    `insert` BEFORE the matching `equal`, or sweep it into a neighbouring
-    `replace` block).
+    ("the the", "c- cat"). Such tokens are removed from the alignment stream and
+    recorded directly as REPETITION so they cannot pollute difflib opcodes.
     """
     hn, hd, hs, he, hc = hyp
     keep_idx = []           # original indices kept for alignment
@@ -302,7 +268,6 @@ def collapse_stutters(hyp):
     i, n = 0, len(hn)
     while i < n:
         tok = hn[i]
-        # look ahead to the next token; flag tok as a stutter of it
         if i + 1 < n:
             nxt = hn[i + 1]
             is_dup = (tok == nxt)
@@ -331,10 +296,8 @@ def pair_replace_block(rn, hn, i1, i2, j1, j2):
     """Best-similarity 1:1 pairing of a replace block's sub-sequences.
 
     Returns (pairs, ref_leftover, hyp_leftover) where pairs is a list of
-    (ref_idx, hyp_idx) into the original arrays, ref_leftover/hyp_leftover are
-    lists of unpaired absolute indices. Pairs are chosen greedily by descending
-    SequenceMatcher ratio so e.g. lazy<->lacy and dog<->cat pair correctly even
-    when an extra token shifts the naive positional order.
+    (ref_idx, hyp_idx) into the original arrays. Pairs are chosen greedily by
+    descending SequenceMatcher ratio so close pairs match across length skews.
     """
     refs = list(range(i1, i2))
     hyps = list(range(j1, j2))
@@ -343,7 +306,6 @@ def pair_replace_block(rn, hn, i1, i2, j1, j2):
         for hj in hyps:
             ratio = SequenceMatcher(None, rn[ri], hn[hj]).ratio()
             cand.append((ratio, ri, hj))
-    # prefer higher ratio; tie-break keeping original order alignment small
     cand.sort(key=lambda t: (-t[0], abs((t[1] - i1) - (t[2] - j1)), t[1], t[2]))
     used_ref, used_hyp, pairs = set(), set(), []
     for ratio, ri, hj in cand:
@@ -352,24 +314,21 @@ def pair_replace_block(rn, hn, i1, i2, j1, j2):
         used_ref.add(ri)
         used_hyp.add(hj)
         pairs.append((ri, hj))
-    # keep pairs in reference order for stable, readable output
     pairs.sort(key=lambda p: p[0])
     ref_leftover = [r for r in refs if r not in used_ref]
     hyp_leftover = [h for h in hyps if h not in used_hyp]
     return pairs, ref_leftover, hyp_leftover
 
 
-def align_and_classify(ref, hyp):
+def align_and_classify(profile, ref, hyp):
     """Align normalized streams and classify every item.
 
-    ref/hyp are the parallel-array tuples (norm, disp, start, end, conf).
-    Returns a list of item dicts (one per scored ref token and per extra hyp
-    token) with keys: ref_word, hyp_word, type, ref_pos, hyp_pos, time_start,
-    confidence.
+    ref is (norm, disp, start, end, conf, is_proper); hyp is the 5-tuple. Returns
+    a list of item dicts with keys ref_word, hyp_word, type, ref_pos, hyp_pos,
+    time_start, confidence, is_proper. Replace-pair classification is delegated
+    to ``profile.classify_replace_pair``.
     """
-    rn, rd, _, _, _ = ref
-    # Pre-pass: pull immediate stutters out of the hyp stream so they are
-    # tagged REPETITION and cannot pollute difflib opcodes (see bugs 2 & 3).
+    rn, rd, _, _, _, r_proper = ref
     (hn, hd, hs, he, hc), _keep, rep_items = collapse_stutters(hyp)
     items = []
     prev_read_norm = None  # last hyp token actually emitted (for stutters)
@@ -382,6 +341,7 @@ def align_and_classify(ref, hyp):
             "ref_word": ref_word, "hyp_word": hyp_word, "type": typ,
             "ref_pos": ref_pos, "hyp_pos": hyp_pos,
             "time_start": ts, "confidence": cf,
+            "is_proper": bool(r_proper[ref_pos]) if ref_pos is not None else False,
         })
         if hyp_pos is not None:
             prev_read_norm = hn[hyp_pos]
@@ -403,7 +363,6 @@ def align_and_classify(ref, hyp):
                       and prev_read_norm.startswith(tok)):
                     add(None, hd[k], REPETITION, None, k)
                 else:
-                    # partial-word stutter: prefix of the next ref word
                     nxt = rn[i1] if i1 < len(rn) else None
                     if nxt and len(tok) >= 2 and nxt.startswith(tok) and tok != nxt:
                         add(None, hd[k], REPETITION, None, k)
@@ -411,13 +370,11 @@ def align_and_classify(ref, hyp):
                         add(None, hd[k], INSERTION, None, k)
         elif tag == "replace":
             la, lb = i2 - i1, j2 - j1
-            # secondary 1:1 pairing of sub-sequences by best similarity (not a
-            # naive positional zip) so close pairs match across length skews.
             pairs, ref_leftover, hyp_leftover = pair_replace_block(
                 rn, hn, i1, i2, j1, j2)
             for ri, ci in pairs:
-                add(rd[ri], hd[ci], classify_replace_pair(rn[ri], hn[ci]),
-                    ri, ci)
+                add(rd[ri], hd[ci],
+                    profile.classify_replace_pair(rn[ri], hn[ci]), ri, ci)
             for ri in ref_leftover:
                 add(rd[ri], None, OMISSION, ri, None)
             for ci in hyp_leftover:
@@ -458,14 +415,19 @@ def compute_metrics(items, n_ref):
 
 
 def compute_speech_rate(hyp, n_correct_ref):
-    """Speaking time, WPM, pauses, articulation rate, sliding-window timeline."""
+    """Speaking time, rate, pauses, articulation rate, sliding-window timeline.
+
+    ``rate`` is in the profile's units per minute (WPM for word, CPM for char):
+    overall_rate uses ``n_correct_ref`` correctly-read reference units; the 30s
+    window and articulation rate count hyp unit starts.
+    """
     _, _, starts, ends, _ = hyp
     pairs = [(s, e) for s, e in zip(starts, ends)
              if s is not None and e is not None]
     out = {
-        "speaking_time": 0.0, "minutes": 0.0, "overall_wpm": 0.0,
+        "speaking_time": 0.0, "minutes": 0.0, "overall_rate": 0.0,
         "articulation_rate": 0.0, "n_pauses": 0, "total_pause": 0.0,
-        "longest_pause": 0.0, "n_hyp_words": len(pairs),
+        "longest_pause": 0.0, "n_hyp_units": len(pairs),
         "timeline": [], "pauses": [],
     }
     if len(pairs) < 1:
@@ -477,7 +439,6 @@ def compute_speech_rate(hyp, n_correct_ref):
     out["speaking_time"] = speaking_time
     out["minutes"] = minutes
 
-    # pauses (gaps between consecutive words)
     _, hd = hyp[0], hyp[1]
     pause_total, longest, n_pauses, pause_rows = 0.0, 0.0, 0, []
     for idx in range(1, len(pairs)):
@@ -496,13 +457,11 @@ def compute_speech_rate(hyp, n_correct_ref):
     out["longest_pause"] = longest
     out["pauses"] = pause_rows
 
-    # WPM from correctly-read ref words (so stutters don't inflate)
-    out["overall_wpm"] = (n_correct_ref / minutes) if minutes > 0 else 0.0
+    out["overall_rate"] = (n_correct_ref / minutes) if minutes > 0 else 0.0
     artic_span = speaking_time - pause_total
     out["articulation_rate"] = (len(pairs) / (artic_span / 60.0)
                                 if artic_span > 0 else 0.0)
 
-    # sliding window: 30s wide, 5s step, anchored at first_start
     win, step = 30.0, 5.0
     timeline = []
     t = first_start
@@ -511,29 +470,36 @@ def compute_speech_rate(hyp, n_correct_ref):
         span = w_end - t
         n_in = sum(1 for s, _ in pairs if t <= s < w_end)
         if span >= 5.0:
-            wpm = n_in / (span / 60.0) if span > 0 else 0.0
-            timeline.append((t, w_end, wpm, n_in))
+            rate = n_in / (span / 60.0) if span > 0 else 0.0
+            timeline.append((t, w_end, rate, n_in))
         t += step
     out["timeline"] = timeline
     return out
 
 
 # --------------------------------------------------------------------------- #
-# Focus words & phoneme groups
+# Focus words & sound groups
 # --------------------------------------------------------------------------- #
-def build_focus_words(items):
-    """Aggregate per reference word -> focus_words rows (DataFrame)."""
+def build_focus_words(profile, items):
+    """Aggregate per reference word -> focus_words rows (DataFrame).
+
+    Proper nouns are kept (with is_proper=True) so names stay visible, but the
+    caller excludes them from the headline list and plot. Sound-group notes come
+    from ``profile.sound_groups_for`` (empty for non-EN profiles).
+    """
     agg = {}  # norm -> dict
     for it in items:
         if it["ref_pos"] is None:   # insertions/repetitions have no ref word
             continue
-        norm = normalize_word(it["ref_word"])
+        norm = _normalize_parts(profile, it["ref_word"])
         norm = norm[0] if norm else (it["ref_word"] or "")
         d = agg.setdefault(norm, {
             "word": norm, "display": it["ref_word"], "occurrences": 0,
             "n_errors": 0, "types": {}, "confs": [],
+            "is_proper": bool(it.get("is_proper")),
         })
         d["occurrences"] += 1
+        d["is_proper"] = d["is_proper"] or bool(it.get("is_proper"))
         if it["confidence"] is not None:
             d["confs"].append(it["confidence"])
         if it["type"] != CORRECT:
@@ -559,7 +525,7 @@ def build_focus_words(items):
         if d["n_errors"] == 0 and not low_conf:
             continue
         dom_type = max(t, key=t.get) if t else ""
-        pg = phoneme_groups_for(norm)
+        pg = profile.sound_groups_for(norm, norm)
         note = build_note(dom_type, pg)
         rows.append({
             "word": norm, "display": d["display"], "occurrences": occ,
@@ -569,20 +535,17 @@ def build_focus_words(items):
             "min_confidence": round(min_c, 4) if not math.isnan(min_c) else "",
             "focus_score": round(focus_score, 4),
             "phoneme_group": ";".join(pg),
+            "is_proper": bool(d["is_proper"]),
             "note": note,
             "_dom_type": dom_type,
         })
     df = pd.DataFrame(rows, columns=[
         "word", "display", "occurrences", "n_errors", "error_types",
         "mean_confidence", "min_confidence", "focus_score",
-        "phoneme_group", "note", "_dom_type"])
+        "phoneme_group", "is_proper", "note", "_dom_type"])
     if not df.empty:
         df = df.sort_values("focus_score", ascending=False).reset_index(drop=True)
     return df
-
-
-def phoneme_groups_for(norm):
-    return [g for g, rx in PHONEME_GROUPS if rx.search(norm)]
 
 
 def build_note(dom_type, pg):
@@ -596,19 +559,26 @@ def build_note(dom_type, pg):
     return " | ".join(parts) if parts else "review"
 
 
-def build_phoneme_table(items):
-    """Per phoneme-group word/error counts -> DataFrame + err_rate dict."""
-    stat = {g: {"words": set(), "errs": 0, "confs": [], "examples": []}
-            for g, _ in PHONEME_GROUPS}
+def build_phoneme_table(profile, items):
+    """Per sound-group word/error counts -> DataFrame + err_rate dict.
+
+    Returns an empty DataFrame (and {}) when the profile yields no sound groups,
+    so non-EN sessions skip the phoneme outputs entirely.
+    """
+    stat = {}  # group -> stats; discovered lazily from the profile
+    order = []
     for it in items:
         if it["ref_pos"] is None:
             continue
-        norm = normalize_word(it["ref_word"])
+        norm = _normalize_parts(profile, it["ref_word"])
         norm = norm[0] if norm else ""
         if not norm:
             continue
         is_err = it["type"] != CORRECT
-        for g in phoneme_groups_for(norm):
+        for g in profile.sound_groups_for(norm, norm):
+            if g not in stat:
+                stat[g] = {"words": set(), "errs": 0, "confs": [], "examples": []}
+                order.append(g)
             s = stat[g]
             s["words"].add(norm)
             if it["confidence"] is not None:
@@ -618,7 +588,7 @@ def build_phoneme_table(items):
                 if norm not in s["examples"] and len(s["examples"]) < 5:
                     s["examples"].append(norm)
     rows, err_rates = [], {}
-    for g, _ in PHONEME_GROUPS:
+    for g in order:
         s = stat[g]
         nw = len(s["words"])
         ne = s["errs"]
@@ -637,16 +607,14 @@ def build_phoneme_table(items):
 # --------------------------------------------------------------------------- #
 # Paragraph & sentence analysis
 # --------------------------------------------------------------------------- #
-def build_paragraphs(body, items, rate):
-    """Per-paragraph accuracy/confidence/local_wpm -> DataFrame."""
-    # map ref token index -> item (correct/error). Build ref-token -> para idx.
+def build_paragraphs(profile, body, items, rate):
+    """Per-paragraph accuracy/confidence/local rate -> DataFrame."""
     para_of_token, tok = [], 0
     for p_idx, para in enumerate(body.split("\n\n")):
-        ntok = len(tokenize_text(para)[0])
+        ntok = len(tokenize_text(profile, para)[0])
         for _ in range(ntok):
             para_of_token.append(p_idx)
             tok += 1
-    # items keyed by ref_pos
     by_ref = {}
     for it in items:
         if it["ref_pos"] is not None:
@@ -671,29 +639,29 @@ def build_paragraphs(body, items, rate):
         n = d["n"]
         acc = (n - d["err"]) / n if n else 0.0
         mc = sum(d["confs"]) / len(d["confs"]) if d["confs"] else float("nan")
-        local_wpm = 0.0
+        local_rate = 0.0
         if len(d["starts"]) >= 2:
             span = max(d["starts"]) - min(d["starts"])
-            local_wpm = n / (span / 60.0) if span > 0 else 0.0
+            local_rate = n / (span / 60.0) if span > 0 else 0.0
         preview = " ".join(para_texts[p_idx].split()[:10]) if p_idx < len(para_texts) else ""
         rows.append({
-            "para_idx": p_idx, "n_words": n, "n_errors": d["err"],
+            "para_idx": p_idx, "n_units": n, "n_errors": d["err"],
             "accuracy": round(acc, 4),
             "mean_confidence": round(mc, 4) if not math.isnan(mc) else "",
-            "local_wpm": round(local_wpm, 1), "preview": preview,
+            "local_rate": round(local_rate, 1), "preview": preview,
         })
     return pd.DataFrame(rows, columns=[
-        "para_idx", "n_words", "n_errors", "accuracy",
-        "mean_confidence", "local_wpm", "preview"])
+        "para_idx", "n_units", "n_errors", "accuracy",
+        "mean_confidence", "local_rate", "preview"])
 
 
-def build_sentence_hotspots(body, items, session_wpm):
+def build_sentence_hotspots(profile, body, items, session_rate):
     """Split ref on .?! and rank sentences by error density."""
     by_ref = {it["ref_pos"]: it for it in items if it["ref_pos"] is not None}
     sentences = re.split(r"(?<=[.?!])\s+", body.replace("\n", " "))
     rows, tok = [], 0
     for s_idx, sent in enumerate(sentences):
-        ntok = len(tokenize_text(sent)[0])
+        ntok = len(tokenize_text(profile, sent)[0])
         if ntok == 0:
             continue
         err, confs, starts = 0, [], []
@@ -708,22 +676,22 @@ def build_sentence_hotspots(body, items, session_wpm):
                     starts.append(it["time_start"])
         tok += ntok
         density = err / ntok if ntok else 0.0
-        local_wpm = 0.0
+        local_rate = 0.0
         if len(starts) >= 2:
             span = max(starts) - min(starts)
-            local_wpm = ntok / (span / 60.0) if span > 0 else 0.0
-        deviates = (session_wpm > 0 and local_wpm > 0 and
-                    abs(local_wpm - session_wpm) / session_wpm > 0.25)
+            local_rate = ntok / (span / 60.0) if span > 0 else 0.0
+        deviates = (session_rate > 0 and local_rate > 0 and
+                    abs(local_rate - session_rate) / session_rate > 0.25)
         rows.append({
-            "sentence_idx": s_idx, "n_words": ntok, "n_errors": err,
+            "sentence_idx": s_idx, "n_units": ntok, "n_errors": err,
             "error_density": round(density, 4),
-            "local_wpm": round(local_wpm, 1),
-            "wpm_deviates": bool(deviates),
+            "local_rate": round(local_rate, 1),
+            "rate_deviates": bool(deviates),
             "preview": " ".join(sent.split()[:14]),
         })
     df = pd.DataFrame(rows, columns=[
-        "sentence_idx", "n_words", "n_errors", "error_density",
-        "local_wpm", "wpm_deviates", "preview"])
+        "sentence_idx", "n_units", "n_errors", "error_density",
+        "local_rate", "rate_deviates", "preview"])
     if not df.empty:
         df = df.sort_values("error_density", ascending=False).reset_index(drop=True)
     return df
@@ -737,16 +705,18 @@ def write_errors_csv(path, items):
         "idx": i, "ref_word": it["ref_word"], "hyp_word": it["hyp_word"],
         "type": it["type"], "ref_pos": it["ref_pos"], "hyp_pos": it["hyp_pos"],
         "time_start": it["time_start"], "confidence": it["confidence"],
+        "is_proper": bool(it.get("is_proper")),
     } for i, it in enumerate(it2 for it2 in items if it2["type"] != CORRECT)]
     pd.DataFrame(rows, columns=[
         "idx", "ref_word", "hyp_word", "type", "ref_pos", "hyp_pos",
-        "time_start", "confidence"]).to_csv(path, index=False)
+        "time_start", "confidence", "is_proper"]).to_csv(path, index=False)
 
 
-def write_summary_csv(path, label, metrics, rate):
+def write_summary_csv(path, label, profile, metrics, rate):
     row = {
         "chapter": label,
-        "n_ref_words": metrics["n_ref"],
+        "language": profile.code,
+        "n_ref_units": metrics["n_ref"],
         "correct": metrics["correct"],
         "accuracy": round(metrics["accuracy"], 4),
         "wer": round(metrics["wer"], 4),
@@ -756,7 +726,8 @@ def write_summary_csv(path, label, metrics, rate):
         "ending_mixups": metrics[ENDING],
         "mispronunciations": metrics[MISP],
         "substitutions": metrics[SUBST],
-        "overall_wpm": round(rate["overall_wpm"], 1),
+        "overall_rate": round(rate["overall_rate"], 1),
+        "rate_unit": profile.rate_unit_label,
         "articulation_rate": round(rate["articulation_rate"], 1),
         "mean_confidence": (round(metrics["mean_confidence"], 4)
                             if not math.isnan(metrics["mean_confidence"]) else ""),
@@ -766,7 +737,7 @@ def write_summary_csv(path, label, metrics, rate):
         "total_pause_s": round(rate["total_pause"], 2),
         "longest_pause_s": round(rate["longest_pause"], 2),
         "duration_min": round(rate["minutes"], 3),
-        "n_hyp_words": rate["n_hyp_words"],
+        "n_hyp_units": rate["n_hyp_units"],
     }
     pd.DataFrame([row]).to_csv(path, index=False)
 
@@ -774,26 +745,28 @@ def write_summary_csv(path, label, metrics, rate):
 # --------------------------------------------------------------------------- #
 # Per-session plots
 # --------------------------------------------------------------------------- #
-def plot_wpm_timeline(path, label, rate):
+def plot_rate_timeline(path, label, profile, rate):
     timeline = rate["timeline"]
+    unit = profile.rate_unit_label
+    lo, hi = profile.comfortable_rate
     fig, ax = plt.subplots(figsize=(10, 4))
     if timeline:
         xs = [(a + b) / 2 for a, b, _, _ in timeline]
         ys = [w for _, _, w, _ in timeline]
-        ax.plot(xs, ys, "-o", ms=3, color="#1f77b4", label="WPM (30s window)")
-        mean_wpm = sum(ys) / len(ys)
-        ax.axhline(mean_wpm, color="green", ls="--",
-                   label=f"mean {mean_wpm:.0f}")
-        ax.axhspan(COMFORT_LOW, COMFORT_HIGH, color="green", alpha=0.10,
-                   label=f"comfortable {COMFORT_LOW}-{COMFORT_HIGH}")
+        ax.plot(xs, ys, "-o", ms=3, color="#1f77b4", label=f"{unit} (30s window)")
+        mean_rate = sum(ys) / len(ys)
+        ax.axhline(mean_rate, color="green", ls="--",
+                   label=f"mean {mean_rate:.0f}")
+        ax.axhspan(lo, hi, color="green", alpha=0.10,
+                   label=f"comfortable {lo}-{hi}")
         for pr in rate["pauses"]:
             ax.axvline(pr["start"], color="red", alpha=0.25, lw=1)
     else:
         ax.text(0.5, 0.5, "no timing data", ha="center", va="center",
                 transform=ax.transAxes)
     ax.set_xlabel("time (s)")
-    ax.set_ylabel("words per minute")
-    ax.set_title(f"WPM timeline - {label}")
+    ax.set_ylabel(f"{unit} (units per minute)")
+    ax.set_title(f"{unit} timeline - {label}")
     ax.legend(loc="upper right", fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=120)
@@ -821,12 +794,14 @@ _TYPE_COLOR = {SUBST: "#d62728", MISP: "#ff7f0e", ENDING: "#9467bd",
 
 
 def plot_focus_words(path, label, fdf):
+    """Plot the top drillable focus words, EXCLUDING proper nouns (names)."""
     fig, ax = plt.subplots(figsize=(9, 6))
-    if fdf.empty:
+    drill = fdf[~fdf["is_proper"]] if not fdf.empty else fdf
+    if drill.empty:
         ax.text(0.5, 0.5, "no focus words - clean read!",
                 ha="center", va="center", transform=ax.transAxes)
     else:
-        top = fdf.head(15).iloc[::-1]
+        top = drill.head(15).iloc[::-1]
         colors = [_TYPE_COLOR.get(t, "#333333") for t in top["_dom_type"]]
         ax.barh(top["word"], top["focus_score"], color=colors)
         for y, (_, r) in enumerate(top.iterrows()):
@@ -852,7 +827,7 @@ def plot_confidence_hist(path, label, items):
     else:
         ax.text(0.5, 0.5, "no confidence data", ha="center", va="center",
                 transform=ax.transAxes)
-    ax.set_xlabel("per-word confidence")
+    ax.set_xlabel("per-unit confidence")
     ax.set_ylabel("count")
     ax.set_title(f"Confidence distribution - {label}")
     fig.tight_layout()
@@ -880,12 +855,17 @@ def plot_phoneme_groups(path, label, pdf):
 # --------------------------------------------------------------------------- #
 # Cumulative progress
 # --------------------------------------------------------------------------- #
-def upsert_session(label, metrics, rate, err_rates):
+def upsert_session(label, profile, metrics, rate):
+    """Append/replace this (chapter, language) row in the language-agnostic
+    sessions.csv. Migrates a legacy (err_rate_* / n_ref_words / overall_wpm)
+    schema on read so old rows survive the new columns.
+    """
     config.ensure_dirs()
     row = {
         "date": datetime.date.today().isoformat(),
         "chapter": label,
-        "n_ref_words": metrics["n_ref"],
+        "language": profile.code,
+        "n_ref_units": metrics["n_ref"],
         "accuracy": round(metrics["accuracy"], 4),
         "wer": round(metrics["wer"], 4),
         "omissions": metrics[OMISSION],
@@ -894,30 +874,49 @@ def upsert_session(label, metrics, rate, err_rates):
         "ending_mixups": metrics[ENDING],
         "mispronunciations": metrics[MISP],
         "substitutions": metrics[SUBST],
-        "overall_wpm": round(rate["overall_wpm"], 1),
+        "overall_rate": round(rate["overall_rate"], 1),
         "articulation_rate": round(rate["articulation_rate"], 1),
         "mean_confidence": (round(metrics["mean_confidence"], 4)
                             if not math.isnan(metrics["mean_confidence"]) else ""),
         "n_pauses": rate["n_pauses"],
         "duration_min": round(rate["minutes"], 3),
     }
-    for g, _ in PHONEME_GROUPS:
-        row[f"err_rate_{g}"] = round(err_rates.get(g, 0.0), 4)
 
     if config.SESSIONS_CSV.exists():
         try:
             existing = pd.read_csv(config.SESSIONS_CSV)
         except Exception:
             existing = pd.DataFrame(columns=SESSION_COLUMNS)
-        existing = existing[existing["chapter"] != label]
+        existing = _migrate_sessions(existing)
+        mask = ~((existing["chapter"] == label) &
+                 (existing["language"] == profile.code))
+        existing = existing[mask]
         df = pd.concat([existing, pd.DataFrame([row])], ignore_index=True)
     else:
         df = pd.DataFrame([row])
     df = df.reindex(columns=SESSION_COLUMNS)
-    # atomic write
     tmp = config.SESSIONS_CSV.with_suffix(".csv.tmp")
     df.to_csv(tmp, index=False)
     os.replace(tmp, config.SESSIONS_CSV)
+    return df
+
+
+def _migrate_sessions(df):
+    """Bring an old-schema sessions.csv up to SESSION_COLUMNS in place."""
+    if df.empty:
+        return df.reindex(columns=SESSION_COLUMNS)
+    rename = {}
+    if "overall_wpm" in df.columns and "overall_rate" not in df.columns:
+        rename["overall_wpm"] = "overall_rate"
+    if "n_ref_words" in df.columns and "n_ref_units" not in df.columns:
+        rename["n_ref_words"] = "n_ref_units"
+    if rename:
+        df = df.rename(columns=rename)
+    drop = [c for c in df.columns if c.startswith("err_rate_")]
+    if drop:
+        df = df.drop(columns=drop)
+    if "language" not in df.columns:
+        df["language"] = "en"     # legacy rows were English-only
     return df
 
 
@@ -925,7 +924,7 @@ def _rolling(series, window=3):
     return series.rolling(window=window, min_periods=1).mean()
 
 
-def plot_progress(df):
+def plot_progress(df, profile):
     if df.empty:
         return
     df = df.sort_values("date").reset_index(drop=True)
@@ -952,21 +951,24 @@ def plot_progress(df):
     fig.savefig(config.PROGRESS_DIR / "progress_accuracy_wer.png", dpi=120)
     plt.close(fig)
 
-    # wpm + articulation
+    # rate + articulation
+    unit = profile.rate_unit_label
+    lo, hi = profile.comfortable_rate
     fig, ax = plt.subplots(figsize=(10, 4))
-    wpm = pd.to_numeric(df["overall_wpm"], errors="coerce")
+    rate = pd.to_numeric(df["overall_rate"], errors="coerce")
     art = pd.to_numeric(df["articulation_rate"], errors="coerce")
-    ax.axhspan(COMFORT_LOW, COMFORT_HIGH, color="green", alpha=0.10,
-               label=f"comfortable {COMFORT_LOW}-{COMFORT_HIGH}")
-    ax.plot(x, wpm, "-o", color="#1f77b4", label="overall WPM")
+    ax.axhspan(lo, hi, color="green", alpha=0.10,
+               label=f"comfortable {lo}-{hi}")
+    ax.plot(x, rate, "-o", color="#1f77b4", label=f"overall {unit}")
     ax.plot(x, art, "-o", color="#ff7f0e", label="articulation rate")
-    ax.plot(x, _rolling(wpm), "--", color="#1f77b4", alpha=0.5, label="wpm roll(3)")
+    ax.plot(x, _rolling(rate), "--", color="#1f77b4", alpha=0.5,
+            label=f"{unit} roll(3)")
     if len(df) >= 2:
-        ax.annotate(f"wpm {wpm.iloc[0]:.0f}->{wpm.iloc[-1]:.0f}",
-                    xy=(x[-1], wpm.iloc[-1]), fontsize=8)
+        ax.annotate(f"{unit} {rate.iloc[0]:.0f}->{rate.iloc[-1]:.0f}",
+                    xy=(x[-1], rate.iloc[-1]), fontsize=8)
     ax.set_xticks(x)
     ax.set_xticklabels(xlabels, fontsize=7)
-    ax.set_ylabel("words per minute")
+    ax.set_ylabel(f"{unit} (units per minute)")
     ax.set_title("Progress: speaking rate over sessions")
     ax.legend(fontsize=8)
     fig.tight_layout()
@@ -992,14 +994,42 @@ def plot_progress(df):
     fig.savefig(config.PROGRESS_DIR / "progress_errors.png", dpi=120)
     plt.close(fig)
 
-    # per-group error-rate trend
+
+def plot_progress_phoneme_groups():
+    """Per-group error-rate trend, rebuilt by re-reading every session's
+    phoneme_groups.csv (sound-group rates are no longer stored in sessions.csv).
+
+    Aggregates all chapters' EN csvs regardless of the current run's language;
+    that is fine since non-EN sessions never write that csv. Skips silently if
+    no phoneme_groups.csv exists.
+    """
+    glob = sorted(config.REPORTS_DIR.glob("*/phoneme_groups.csv"))
+    series = {}  # group -> list of (key, err_rate)
+    for pcsv in glob:
+        try:
+            d = pd.read_csv(pcsv)
+        except Exception:
+            continue
+        if d.empty or "group" not in d.columns:
+            continue
+        key = pcsv.parent.name
+        for _, r in d.iterrows():
+            nw = float(r.get("n_words", 0) or 0)
+            ne = float(r.get("n_errors", 0) or 0)
+            rate = (ne / nw) if nw else 0.0
+            series.setdefault(str(r["group"]), []).append((key, rate))
+    if not series:
+        return
+    keys = sorted({k for pts in series.values() for k, _ in pts})
+    xidx = {k: i for i, k in enumerate(keys)}
     fig, ax = plt.subplots(figsize=(10, 4))
-    for g, _ in PHONEME_GROUPS:
-        col = f"err_rate_{g}"
-        if col in df.columns:
-            ax.plot(x, pd.to_numeric(df[col], errors="coerce"), "-o", ms=3, label=g)
-    ax.set_xticks(x)
-    ax.set_xticklabels(xlabels, fontsize=7)
+    for g, pts in series.items():
+        pts = sorted(pts, key=lambda kv: xidx[kv[0]])
+        xs = [xidx[k] for k, _ in pts]
+        ys = [v for _, v in pts]
+        ax.plot(xs, ys, "-o", ms=3, label=g)
+    ax.set_xticks(list(range(len(keys))))
+    ax.set_xticklabels([k[:18] for k in keys], fontsize=7, rotation=0)
     ax.set_ylabel("error rate")
     ax.set_title("Progress: phoneme-group error rate trend")
     ax.legend(fontsize=7, ncol=4)
@@ -1009,7 +1039,8 @@ def plot_progress(df):
 
 
 def plot_progress_focus_words():
-    """Aggregate top recurring focus words across all per-session focus_words.csv."""
+    """Aggregate top recurring focus words across per-session focus_words.csv,
+    excluding proper nouns (names should not become recurring drills)."""
     agg = {}  # word -> {score, sessions, group}
     for fcsv in config.REPORTS_DIR.glob("*/focus_words.csv"):
         try:
@@ -1019,12 +1050,15 @@ def plot_progress_focus_words():
         if d.empty or "word" not in d.columns:
             continue
         for _, r in d.iterrows():
+            if "is_proper" in d.columns and bool(r.get("is_proper")):
+                continue
             w = str(r["word"])
             e = agg.setdefault(w, {"score": 0.0, "sessions": 0, "group": ""})
             e["score"] += float(r.get("focus_score", 0) or 0)
             e["sessions"] += 1
-            if not e["group"] and isinstance(r.get("phoneme_group"), str):
-                e["group"] = str(r.get("phoneme_group")).split(";")[0]
+            grp = r.get("phoneme_group")
+            if not e["group"] and isinstance(grp, str):
+                e["group"] = grp.split(";")[0]
     fig, ax = plt.subplots(figsize=(9, 6))
     if not agg:
         ax.text(0.5, 0.5, "no recurring focus words yet",
@@ -1035,10 +1069,7 @@ def plot_progress_focus_words():
                        reverse=True)[:15][::-1]
         words = [w for w, _ in items]
         scores = [v["score"] for _, v in items]
-        colors = []
-        gset = {g for g, _ in PHONEME_GROUPS}
-        for _, v in items:
-            colors.append("#8c564b" if v["group"] in gset else "#1f77b4")
+        colors = ["#8c564b" if v["group"] else "#1f77b4" for _, v in items]
         ax.barh(words, scores, color=colors)
         for y, (w, v) in enumerate(items):
             ax.text(scores[y], y, f" x{v['sessions']}", va="center", fontsize=7)
@@ -1057,6 +1088,9 @@ def parse_args(argv):
     p.add_argument("chapter", nargs="?", default=None,
                    help="chapter label (TOC heading); optional if "
                         "--reference/--transcript/--label are given")
+    p.add_argument("--language", "-l", default=config.DEFAULT_LANGUAGE,
+                   help="analysis language profile (en, generic, ja, ...); "
+                        f"default {config.DEFAULT_LANGUAGE}")
     p.add_argument("--reference", help="override reference .txt path")
     p.add_argument("--transcript", help="override transcript .json path")
     p.add_argument("--label", help="override label for output dirs/progress key")
@@ -1067,9 +1101,8 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    profile = languages.get_profile(args.language)
 
-    # `chapter` is optional: only required to derive default ref/transcript
-    # paths or the output label. Validate that we can resolve each.
     if args.reference is None and args.chapter is None:
         sys.exit("ERROR: provide a chapter label (or --reference) to locate "
                  "the reference text.")
@@ -1079,70 +1112,77 @@ def main(argv=None):
 
     ref_path = (config.Path(args.reference) if args.reference
                 else config.chapter_txt(args.chapter))
-    title, ref, body = load_reference(ref_path)
+    title, ref, body = load_reference(profile, ref_path)
 
     hyp_path = resolve_transcript_path(args, args.chapter)
-    hyp = load_transcript(hyp_path)
+    hyp = load_transcript(profile, hyp_path)
 
     rdir = config.report_dir(label)
     rdir.mkdir(parents=True, exist_ok=True)
 
     n_ref = len(ref[0])
-    items = align_and_classify(ref, hyp)
+    items = align_and_classify(profile, ref, hyp)
     metrics = compute_metrics(items, n_ref)
     n_correct_ref = metrics["correct"] + metrics[ENDING] + metrics[MISP] + metrics[SUBST]
     rate = compute_speech_rate(hyp, n_correct_ref)
 
-    fdf = build_focus_words(items)
-    pdf, err_rates = build_phoneme_table(items)
-    para_df = build_paragraphs(body, items, rate)
-    sent_df = build_sentence_hotspots(body, items, rate["overall_wpm"])
+    fdf = build_focus_words(profile, items)
+    pdf, err_rates = build_phoneme_table(profile, items)
+    has_sound_groups = not pdf.empty
+    para_df = build_paragraphs(profile, body, items, rate)
+    sent_df = build_sentence_hotspots(profile, body, items, rate["overall_rate"])
 
     # ---- CSV reports ----
     write_errors_csv(rdir / "errors.csv", items)
     fdf.drop(columns=["_dom_type"]).to_csv(rdir / "focus_words.csv", index=False)
     pd.DataFrame(rate["timeline"],
-                 columns=["t_start", "t_end", "wpm", "n_words"]
+                 columns=["t_start", "t_end", "rate", "n_units"]
                  ).to_csv(rdir / "wpm_timeline.csv", index=False)
     pd.DataFrame(rate["pauses"],
                  columns=["start", "end", "duration", "after_word"]
                  ).to_csv(rdir / "pauses.csv", index=False)
-    write_summary_csv(rdir / "summary.csv", label, metrics, rate)
-    pdf.to_csv(rdir / "phoneme_groups.csv", index=False)
+    write_summary_csv(rdir / "summary.csv", label, profile, metrics, rate)
+    if has_sound_groups:
+        pdf.to_csv(rdir / "phoneme_groups.csv", index=False)
     para_df.to_csv(rdir / "paragraphs.csv", index=False)
     sent_df.to_csv(rdir / "sentence_hotspots.csv", index=False)
 
     # ---- PNG diagrams (skip heavy plots only if no scored tokens) ----
     if n_ref > 0:
-        plot_wpm_timeline(rdir / "wpm_timeline.png", label, rate)
+        plot_rate_timeline(rdir / "wpm_timeline.png", label, profile, rate)
         plot_error_breakdown(rdir / "error_breakdown.png", label, metrics)
         plot_focus_words(rdir / "focus_words.png", label, fdf)
         plot_confidence_hist(rdir / "confidence_hist.png", label, items)
-        plot_phoneme_groups(rdir / "phoneme_groups.png", label, pdf)
+        if has_sound_groups:
+            plot_phoneme_groups(rdir / "phoneme_groups.png", label, pdf)
 
     # ---- progress ----
     if not args.no_progress:
-        sdf = upsert_session(label, metrics, rate, err_rates)
-        plot_progress(sdf)
+        sdf = upsert_session(label, profile, metrics, rate)
+        plot_progress(sdf, profile)
         plot_progress_focus_words()
+        if has_sound_groups:
+            plot_progress_phoneme_groups()
 
     # ---- console summary ----
-    top5 = fdf.head(5)["word"].tolist() if not fdf.empty else []
+    drill = fdf[~fdf["is_proper"]] if not fdf.empty else fdf
+    top5 = drill.head(5)["word"].tolist() if not drill.empty else []
     top_groups = (pdf.sort_values("n_errors", ascending=False).head(3)["group"].tolist()
                   if not pdf.empty else [])
     worst_sent = sent_df.iloc[0]["preview"] if not sent_df.empty else "(none)"
     mc = metrics["mean_confidence"]
-    print(f"== {label} ==")
-    print(f"scored ref words : {n_ref}")
+    unit = profile.rate_unit_label
+    print(f"== {label} ({profile.name}) ==")
+    print(f"scored ref {profile.unit}s : {n_ref}")
     print(f"accuracy         : {metrics['accuracy']*100:.1f}%")
     print(f"WER              : {metrics['wer']*100:.1f}%")
-    print(f"overall WPM      : {rate['overall_wpm']:.0f} "
+    print(f"overall {unit:<8} : {rate['overall_rate']:.0f} "
           f"(articulation {rate['articulation_rate']:.0f})")
     print(f"mean confidence  : {('%.3f' % mc) if not math.isnan(mc) else 'n/a'}")
     print(f"pauses           : {rate['n_pauses']} "
           f"(longest {rate['longest_pause']:.1f}s)")
     print(f"top focus words  : {', '.join(top5) if top5 else '(none)'}")
-    print(f"top phoneme grps : {', '.join(top_groups) if top_groups else '(none)'}")
+    print(f"top sound groups : {', '.join(top_groups) if top_groups else '(none)'}")
     print(f"worst sentence   : {worst_sent}")
     print(f"output dir       : {rdir}")
 

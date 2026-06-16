@@ -187,7 +187,8 @@ def main() -> int:
     )
     parser.add_argument("label", help='Chapter label, e.g. "1.1 JUST A BARREL OF MONKEYS"')
     parser.add_argument("--audio", default=None, help="Override audio path (defaults to config.audio_path(label))")
-    parser.add_argument("-l", "--language", default="en", help="Language code (default: en)")
+    parser.add_argument("-l", "--language", default=config.DEFAULT_LANGUAGE,
+                        help="Language code (default: config.DEFAULT_LANGUAGE)")
     parser.add_argument("--chunk", action="store_true", help="Force chunked processing")
     args = parser.parse_args()
 

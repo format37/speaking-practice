@@ -1,8 +1,10 @@
 # Speaking Practice
 
-Daily English reading-aloud practice for ML-interview prep: read a book chapter
-out loud, transcribe the recording with Deepgram, and compare it against the
-reference text to surface mispronounced / dropped words and track progress over time.
+Daily reading-aloud practice for ML-interview prep: read a book chapter out
+loud, transcribe the recording with Deepgram, and compare it against the
+reference text to surface mispronounced / dropped words and track progress over
+time. English is the default, but the analysis is **language-pluggable** — see
+[Languages](#languages).
 
 ## Daily workflow
 
@@ -46,6 +48,9 @@ python transcribe.py "1.1 JUST A BARREL OF MONKEYS"
 python analyze.py "1.1 JUST A BARREL OF MONKEYS"
 ```
 
+`transcribe.py` and `analyze.py` both take `--language/-l` (default
+`PRACTICE_LANGUAGE`, falling back to `en`) — see [Languages](#languages).
+
 ## Outputs
 
 Everything derived is written under `data/`:
@@ -60,6 +65,43 @@ Everything derived is written under `data/`:
 - `data/reports/_progress/` — cumulative across sessions: `sessions.csv` (one row
   per chapter) and `progress_*.png` charts tracking accuracy/WER, speech rate,
   error trends, and the words that recur most often in your focus list.
+
+## Languages
+
+The analysis is language-pluggable. Pass `--language/-l <code>` to
+`transcribe.py` and `analyze.py` (default `config.DEFAULT_LANGUAGE`, set via the
+`PRACTICE_LANGUAGE` env var, falling back to `en`). The code selects a
+**language profile** that drives every language-specific step (tokenizing,
+normalizing, number handling, error classification, sound groups, and the
+reading-rate band); alignment, metrics, CSV, and plotting stay shared.
+
+Built-in profiles:
+
+- **`en`** — full English profile (the original, verified behavior): English
+  inflectional ending-mixups, confusable pairs, the 8 phoneme/sound groups
+  tuned for a Russian-native learner, proper-noun flagging, and word-level
+  rate in **WPM** (comfortable band ~130–160).
+- **`generic`** — any space-separated, Latin-script language. Casefolding,
+  number normalization, and proper-noun flagging are on, but without the
+  English-specific suffix/confusable/phoneme rules (a generic ending heuristic,
+  no sound groups). Word-level rate in WPM (~130–160). Any unknown language code
+  falls back to this profile, using that code as the Deepgram language.
+- **`ja`** (and `zh`) — **character-level** analysis: text is tokenized per
+  significant character, no casefolding/number-normalization/proper-noun
+  flagging, no ending-mixups or sound groups, and the reading rate is reported
+  in **CPM** (characters per minute, comfortable band ~250–400). Word-level
+  Japanese analysis via an optional MeCab tokenizer is a possible future
+  addition — there is intentionally **no mandatory heavy dependency**.
+
+Sound-group / phoneme outputs (the per-session `phoneme_groups` CSV + plot and
+the progress phoneme chart) are produced only when the active profile defines
+sound groups, i.e. `en`; other profiles skip them cleanly. The cumulative
+`sessions.csv` is language-agnostic and keyed by `(chapter, language)`, so the
+same chapter read in two languages keeps separate rows.
+
+To add a language, add a `LanguageProfile` in `languages.py` (and register it in
+`PROFILES`). Reuse the `en`, `generic`, or `ja` profile as a starting point
+depending on whether your language is word- or character-based.
 
 ## Repo layout
 

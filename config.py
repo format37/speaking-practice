@@ -17,6 +17,7 @@ SESSIONS_CSV = PROGRESS_DIR / "sessions.csv"
 
 DEFAULT_EPUB = BOOK_DIR / "Children-of-Time-Adrian-Tchaikovsky.epub"
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+DEFAULT_LANGUAGE = os.getenv("PRACTICE_LANGUAGE", "en")
 
 
 def ensure_dirs():
