@@ -202,6 +202,20 @@ def _parse_result(content: str) -> ReviewResult:
         r = _coerce_review(items)
         if r is not None:
             return r
+    # 4) last resort: regex out flat item objects (recovers verdicts even from a
+    #    truncated / unclosed-wrapper reply the brace scanner can't yield).
+    flat = []
+    for frag in re.findall(r'\{[^{}]*?"id"[^{}]*?\}', text):
+        try:
+            obj = json.loads(frag)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "id" in obj and "keep" in obj:
+            flat.append(obj)
+    if flat:
+        r = _coerce_review(flat)
+        if r is not None:
+            return r
     raise ValueError("No valid ReviewResult JSON found in model output")
 
 
@@ -571,9 +585,15 @@ def review_errors(
                 content = _openai_review(client, used_model, user_text, schema)
             else:
                 content = _claude_review(used_model, user_text)
+        except Exception as exc:
+            print(f"review: batch {b + 1}/{n_batches} {backend} call failed ({exc}); skipping batch")
+            continue
+        try:
             result = _parse_result(content)
         except Exception as exc:
-            print(f"review: batch {b + 1}/{n_batches} {backend} error ({exc}); skipping batch")
+            head = (content or "").strip().replace("\n", " ")[:160]
+            print(f"review: batch {b + 1}/{n_batches} unparseable reply ({exc}); "
+                  f"head={head!r}; skipping batch")
             continue
 
         for ri in result.items:
