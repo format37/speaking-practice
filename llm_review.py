@@ -294,56 +294,42 @@ def _context_window(ref_tokens, ref_pos) -> str:
 # Caching
 # ---------------------------------------------------------------------------
 
-def _cache_key(items) -> str:
-    """Stable key over item identity + count + model.
-
-    Busts automatically on re-transcription / edited text.
+def _item_sig(it) -> str:
+    """Stable PER-ITEM signature. Busts automatically on re-transcription /
+    edited text. Per-item (not whole-set) keying lets an interrupted review
+    resume: already-judged errors are reused, only the rest are re-queried.
     """
-    sig = [
-        (
+    payload = json.dumps(
+        [
             it.get("type"),
             it.get("ref_word"),
             it.get("hyp_word"),
             round(float(it.get("confidence") or 0.0), 3),
-        )
-        for it in items
-    ]
-    payload = json.dumps(
-        {"items": sig, "count": len(items), "model": config.OPENAI_MODEL},
+            it.get("ref_pos"),
+        ],
         sort_keys=True,
         default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _load_cache(cache_path: Path, key: str):
+def _load_cache(cache_path: Path, model: str) -> dict:
+    """Return ``{item_sig: verdict}`` for ``model``; ``{}`` on miss or old format."""
     try:
         data = json.loads(Path(cache_path).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict) or data.get("key") != key:
-        return None
-    verdicts = data.get("verdicts")
-    if not isinstance(verdicts, dict):
-        return None
-    # JSON object keys are strings; restore int ids.
-    out: dict[int, dict] = {}
-    for k, v in verdicts.items():
-        try:
-            out[int(k)] = v
-        except (TypeError, ValueError):
-            continue
-    return out
+        return {}
+    if not isinstance(data, dict) or data.get("model") != model:
+        return {}
+    by_sig = data.get("by_sig")
+    return by_sig if isinstance(by_sig, dict) else {}
 
 
-def _save_cache(cache_path: Path, key: str, verdicts: dict[int, dict]) -> None:
+def _save_cache(cache_path: Path, model: str, by_sig: dict) -> None:
     try:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
         Path(cache_path).write_text(
-            json.dumps(
-                {"key": key, "verdicts": {str(k): v for k, v in verdicts.items()}},
-                indent=2,
-            ),
+            json.dumps({"model": model, "by_sig": by_sig}, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
     except OSError:
@@ -380,38 +366,51 @@ def review_errors(
     items = list(items)
     if not items:
         return {}
+    used_model = model or config.OPENAI_MODEL
+
+    # ----- per-item cache: reuse known verdicts, query only the rest -------
+    by_sig: dict = {}
+    if cache_path is not None and not refresh:
+        by_sig = _load_cache(Path(cache_path), used_model)
+
+    verdicts: dict[int, dict] = {}
+    to_query = []
+    for it in items:
+        sig = _item_sig(it)
+        if sig in by_sig:
+            verdicts[int(it["id"])] = by_sig[sig]
+        else:
+            to_query.append((sig, it))
+
+    if not to_query:
+        if cache_path is not None:
+            print(f"review: using cached verdicts ({len(verdicts)} items)")
+        return verdicts
 
     if not config.OPENAI_KEY:
         print("OPENAI_KEY not set; falling back to free name-gazetteer denoising")
-        return {}
-
-    # ----- cache fast-path -------------------------------------------------
-    key = _cache_key(items)
-    if cache_path is not None and not refresh:
-        cached = _load_cache(Path(cache_path), key)
-        if cached is not None:
-            print(f"review: using cached verdicts ({len(cached)} items)")
-            return cached
+        return verdicts  # whatever was already cached (possibly empty)
 
     try:
         import openai
     except ImportError:
         print("openai package not installed; falling back to gazetteer denoising")
-        return {}
+        return verdicts
 
-    used_model = model or config.OPENAI_MODEL
     try:
         client = openai.OpenAI(api_key=config.OPENAI_KEY)
     except Exception as exc:  # pragma: no cover - construction rarely fails
         print(f"review: could not init OpenAI client ({exc}); falling back to gazetteer")
-        return {}
+        return verdicts
 
     schema = review_strict_schema()
-    verdicts: dict[int, dict] = {}
+    query_items = [it for _, it in to_query]
+    sig_by_id = {int(it["id"]): sig for sig, it in to_query}
+    new_count = 0
 
-    n_batches = (len(items) + batch_size - 1) // batch_size
+    n_batches = (len(query_items) + batch_size - 1) // batch_size
     for b in range(n_batches):
-        batch = items[b * batch_size:(b + 1) * batch_size]
+        batch = query_items[b * batch_size:(b + 1) * batch_size]
         payload = []
         for it in batch:
             payload.append(
@@ -462,14 +461,24 @@ def review_errors(
 
         for ri in result.items:
             cause = ri.cause if ri.cause in CAUSES else "other_noise"
-            verdicts[int(ri.id)] = {
+            v = {
                 "keep": bool(ri.keep),
                 "cause": cause,
                 "reason": (ri.reason or "")[:120],
             }
+            rid = int(ri.id)
+            verdicts[rid] = v
+            if rid in sig_by_id:
+                by_sig[sig_by_id[rid]] = v
+            new_count += 1
 
-    if cache_path is not None and verdicts:
-        _save_cache(Path(cache_path), key, verdicts)
+        # Persist after EACH batch so an interruption (quota/network) still saves
+        # progress; the next run resumes instead of re-paying for everything.
+        if cache_path is not None and by_sig:
+            _save_cache(Path(cache_path), used_model, by_sig)
 
-    print(f"review: obtained {len(verdicts)} verdicts across {n_batches} batch(es)")
+    print(
+        f"review: obtained {len(verdicts)} verdicts "
+        f"({new_count} new) across {n_batches} batch(es)"
+    )
     return verdicts
