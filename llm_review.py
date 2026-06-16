@@ -80,7 +80,9 @@ SYSTEM = (
     "(real_omission); genuine repeated/stuttered words (real_disfluency).\n"
     "When unsure, keep=true for ordinary in-vocabulary words; set keep=false only "
     "when fairly confident it is an artifact. Judge each item independently using "
-    "its context window."
+    "its context window. Note: rare or technical REAL words (e.g. 'phytoplankton') "
+    "are ordinary vocabulary, NOT proper nouns - classify proper_noun_artifact only "
+    "for invented names/places of people, ships, or settings."
 )
 
 
@@ -337,6 +339,82 @@ def _save_cache(cache_path: Path, model: str, by_sig: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+
+_SCHEMA_HINT = (
+    "Return ONLY a JSON object of exactly this shape - no prose, no markdown, no "
+    'code fences:\n{"items":[{"id":<int>,"keep":<true|false>,"cause":<one of '
+    + json.dumps(CAUSES)
+    + '>,"reason":"<=12 words"}]}'
+)
+
+
+def _openai_review(client, model, user_text, schema) -> str:
+    """One batch via the OpenAI Chat Completions strict json_schema (paid API)."""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": user_text},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "review", "schema": schema, "strict": True},
+        },
+        max_completion_tokens=25000,
+    )
+    return resp.choices[0].message.content
+
+
+def _claude_review(model, user_text) -> str:
+    """One batch via the Claude Agent SDK using the local Claude subscription.
+
+    No API key and no per-token billing: it drives the authenticated ``claude``
+    CLI. Single-shot (max_turns=1, no tools); JSON is requested via the prompt and
+    parsed with the same tolerant parser as the OpenAI path.
+    """
+    import asyncio
+    from claude_agent_sdk import (
+        query, ClaudeAgentOptions, AssistantMessage, TextBlock,
+    )
+
+    async def _run():
+        kwargs = dict(
+            system_prompt=SYSTEM + "\n\n" + _SCHEMA_HINT,
+            max_turns=1,
+            allowed_tools=[],
+            setting_sources=["user"],
+        )
+        if model:
+            kwargs["model"] = model
+        opts = ClaudeAgentOptions(**kwargs)
+        text = ""
+        async for message in query(prompt=user_text, options=opts):
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock):
+                        text += block.text
+        return text.strip()
+
+    try:
+        return asyncio.run(_run())
+    except RuntimeError:
+        # Called from within a running event loop: run on a worker thread.
+        import concurrent.futures
+
+        def _sync():
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(_run())
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(_sync).result()
+
+
+# ---------------------------------------------------------------------------
 # Public review entry point
 # ---------------------------------------------------------------------------
 
@@ -344,6 +422,7 @@ def review_errors(
     items,
     ref_tokens,
     *,
+    backend=None,
     model=None,
     batch_size=40,
     cache_path=None,
@@ -358,20 +437,30 @@ def review_errors(
     model omits or returns malformed defaults to ``keep=True`` (in-vocabulary safe
     default); the caller forces gazetteer names to ``keep=False``.
 
-    Graceful degradation:
-      * No ``OPENAI_KEY`` -> log one line, return ``{}`` (caller falls back to gazetteer).
+    ``backend``: "claude" (default; Claude Agent SDK via the local subscription, no
+    key/cost) or "openai" (Chat Completions, needs ``OPENAI_KEY``). Defaults to
+    ``config.REVIEW_BACKEND``.
+
+    Graceful degradation (never raises):
+      * Backend unavailable (no claude-agent-sdk, or openai without a key) -> log one
+        line, return whatever was cached (caller falls back to the gazetteer).
       * Per-batch API/parse failure -> log + skip that batch only (its ids fall
         through to defaults); other batches still run.
     """
     items = list(items)
     if not items:
         return {}
-    used_model = model or config.OPENAI_MODEL
+    backend = (backend or getattr(config, "REVIEW_BACKEND", "claude") or "claude").lower()
+    if backend == "openai":
+        used_model = model or config.OPENAI_MODEL
+    else:
+        used_model = model or getattr(config, "CLAUDE_REVIEW_MODEL", None)
 
     # ----- per-item cache: reuse known verdicts, query only the rest -------
+    cache_tag = f"{backend}:{used_model or 'default'}"
     by_sig: dict = {}
     if cache_path is not None and not refresh:
-        by_sig = _load_cache(Path(cache_path), used_model)
+        by_sig = _load_cache(Path(cache_path), cache_tag)
 
     verdicts: dict[int, dict] = {}
     to_query = []
@@ -387,20 +476,30 @@ def review_errors(
             print(f"review: using cached verdicts ({len(verdicts)} items)")
         return verdicts
 
-    if not config.OPENAI_KEY:
-        print("OPENAI_KEY not set; falling back to free name-gazetteer denoising")
-        return verdicts  # whatever was already cached (possibly empty)
-
-    try:
-        import openai
-    except ImportError:
-        print("openai package not installed; falling back to gazetteer denoising")
-        return verdicts
-
-    try:
-        client = openai.OpenAI(api_key=config.OPENAI_KEY)
-    except Exception as exc:  # pragma: no cover - construction rarely fails
-        print(f"review: could not init OpenAI client ({exc}); falling back to gazetteer")
+    # ----- backend availability (graceful fallback, never raises) ----------
+    client = None
+    if backend == "openai":
+        if not config.OPENAI_KEY:
+            print("OPENAI_KEY not set; falling back to free name-gazetteer denoising")
+            return verdicts
+        try:
+            import openai
+            client = openai.OpenAI(api_key=config.OPENAI_KEY)
+        except ImportError:
+            print("openai package not installed; falling back to gazetteer denoising")
+            return verdicts
+        except Exception as exc:  # pragma: no cover - construction rarely fails
+            print(f"review: could not init OpenAI client ({exc}); falling back to gazetteer")
+            return verdicts
+    elif backend == "claude":
+        try:
+            import claude_agent_sdk  # noqa: F401
+        except ImportError:
+            print("claude-agent-sdk not installed; falling back to gazetteer denoising "
+                  "(pip install claude-agent-sdk, or set REVIEW_BACKEND=openai)")
+            return verdicts
+    else:
+        print(f"unknown REVIEW_BACKEND {backend!r}; falling back to gazetteer denoising")
         return verdicts
 
     schema = review_strict_schema()
@@ -409,6 +508,7 @@ def review_errors(
     new_count = 0
 
     n_batches = (len(query_items) + batch_size - 1) // batch_size
+    print(f"review: {backend} backend, {len(query_items)} error(s) in {n_batches} batch(es)")
     for b in range(n_batches):
         batch = query_items[b * batch_size:(b + 1) * batch_size]
         payload = []
@@ -429,34 +529,13 @@ def review_errors(
         )
 
         try:
-            resp = client.chat.completions.create(
-                model=used_model,
-                messages=[
-                    {"role": "system", "content": SYSTEM},
-                    {"role": "user", "content": user_text},
-                ],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "review",
-                        "schema": schema,
-                        "strict": True,
-                    },
-                },
-                max_completion_tokens=25000,
-            )
-            content = resp.choices[0].message.content
+            if backend == "openai":
+                content = _openai_review(client, used_model, user_text, schema)
+            else:
+                content = _claude_review(used_model, user_text)
             result = _parse_result(content)
-        except (
-            openai.AuthenticationError,
-            openai.RateLimitError,
-            openai.BadRequestError,
-            openai.APIError,
-        ) as exc:
-            print(f"review: batch {b + 1}/{n_batches} API error ({exc}); skipping batch")
-            continue
         except Exception as exc:
-            print(f"review: batch {b + 1}/{n_batches} failed ({exc}); skipping batch")
+            print(f"review: batch {b + 1}/{n_batches} {backend} error ({exc}); skipping batch")
             continue
 
         for ri in result.items:

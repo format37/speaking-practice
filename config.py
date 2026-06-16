@@ -19,7 +19,14 @@ DEFAULT_EPUB = BOOK_DIR / "Children-of-Time-Adrian-Tchaikovsky.epub"
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 DEFAULT_LANGUAGE = os.getenv("PRACTICE_LANGUAGE", "en")
 
-# OpenAI (only needed for the opt-in 'analyze.py --review' denoising layer).
+# LLM error-review backend (opt-in 'analyze.py --review' denoising layer):
+#   "claude" (default) -> Claude Agent SDK via your local Claude subscription;
+#                         no API key and no per-token billing.
+#   "openai"           -> OpenAI Chat Completions; needs OPENAI_KEY (paid API).
+REVIEW_BACKEND = os.getenv("REVIEW_BACKEND", "claude")
+# Optional model override for the Claude backend (default: the SDK's model).
+CLAUDE_REVIEW_MODEL = os.getenv("CLAUDE_REVIEW_MODEL") or None
+# OpenAI (only needed when REVIEW_BACKEND=openai).
 OPENAI_KEY = os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
 

@@ -6,5 +6,6 @@ pandas
 matplotlib
 ebooklib          # epub parsing (extract_chapter.py)
 beautifulsoup4    # XHTML parsing (extract_chapter.py)
-openai>=1.50      # opt-in LLM error review (analyze.py --review)
-pydantic>=2.0     # strict JSON schema for the LLM review
+pydantic>=2.0       # schema for the opt-in LLM error review (analyze.py --review)
+claude-agent-sdk    # default --review backend: uses your Claude subscription (no API key)
+openai>=1.50        # only for --review-backend openai (paid API; needs OPENAI_KEY)

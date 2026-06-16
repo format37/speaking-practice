@@ -92,20 +92,26 @@ the numbers honest and comparable across chapters:
 
 All of the above runs by default with no API key.
 
-**Opt-in LLM review.** Add `--review` (alias `--llm-review`) to have OpenAI
-judge each candidate error *with its context* and mark it keep/exclude plus a
-cause and a short reason, which then drives the denoised metrics:
+**Opt-in LLM review.** Add `--review` (alias `--llm-review`) to have an LLM judge
+each candidate error *with its context* and mark it keep/exclude plus a cause and
+a short reason, which then drives the denoised metrics:
 
 ```bash
 python analyze.py "1.1 JUST A BARREL OF MONKEYS" --review
 python analyze.py "1.1 JUST A BARREL OF MONKEYS" --review --review-refresh  # ignore cache
 ```
 
-It uses model `gpt-5.5` (override with `OPENAI_MODEL`) and the key in
-`OPENAI_KEY` (you can copy it from `/home/alex/projects/questionarie-master/.env`;
-see `.env.example`). The verdicts are cached per chapter, so it's roughly **one
-API call per chapter**. Without a key it prints a clear message and falls back
-to the free gazetteer — it never crashes.
+Two backends (select with `--review-backend` or the `REVIEW_BACKEND` env var):
+
+- **`claude`** (default) — uses your local **Claude subscription** via the Claude
+  Agent SDK (the authenticated `claude` CLI). **No API key and no per-token cost.**
+- **`openai`** — the paid OpenAI API (model `gpt-5.5`, override with `OPENAI_MODEL`);
+  set `OPENAI_KEY` in `.env`.
+
+Verdicts are cached **per item** per chapter, so an interrupted review *resumes*
+(only the un-judged errors are re-sent) and re-runs are cheap. If the chosen
+backend is unavailable it prints a clear message and falls back to the free
+gazetteer — it never crashes.
 
 ## Languages
 

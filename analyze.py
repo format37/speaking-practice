@@ -1260,7 +1260,7 @@ def plot_progress_focus_words():
 # --------------------------------------------------------------------------- #
 # LLM review orchestration (opt-in --review)
 # --------------------------------------------------------------------------- #
-def run_review(profile, items, ref_disp, gazetteer, rdir, refresh):
+def run_review(profile, items, ref_disp, gazetteer, rdir, refresh, backend=None):
     """Run llm_review over the error items and return (verdicts, keep_flags).
 
     verdicts: id (errors.csv row index) -> {keep,cause,reason}.
@@ -1286,19 +1286,19 @@ def run_review(profile, items, ref_disp, gazetteer, rdir, refresh):
         })
 
     verdicts = {}
-    if llm_review is not None and getattr(config, "OPENAI_KEY", None):
+    if llm_review is not None:
         try:
             cache = rdir / ".review_cache.json"
             verdicts = llm_review.review_errors(
                 review_input, ref_disp,
-                model=getattr(config, "OPENAI_MODEL", None),
+                backend=backend, model=None,
                 cache_path=str(cache), refresh=refresh) or {}
         except Exception as exc:                       # never crash analysis
             print(f"WARNING: LLM review failed ({exc}); "
                   "falling back to free name-gazetteer denoising")
             verdicts = {}
     else:
-        print("OPENAI_KEY not set; falling back to free name-gazetteer denoising")
+        print("llm_review module unavailable; falling back to free name-gazetteer denoising")
 
     # normalize verdict keys to int ids; fill defaults; force names to exclude
     norm_verdicts = {}
@@ -1341,10 +1341,15 @@ def parse_args(argv):
                    help="do not append/update the cumulative sessions row")
     p.add_argument("--review", "--llm-review", dest="review",
                    action="store_true",
-                   help="opt-in: use OpenAI to mark each error keep/exclude "
-                        "(needs OPENAI_KEY; falls back to the free gazetteer)")
+                   help="opt-in: use an LLM to mark each error keep/exclude with a "
+                        "reason (default backend: your Claude subscription, no key/"
+                        "cost; falls back to the free gazetteer)")
+    p.add_argument("--review-backend", choices=["claude", "openai"],
+                   default=getattr(config, "REVIEW_BACKEND", "claude"),
+                   help="LLM backend for --review: 'claude' (subscription, default) "
+                        "or 'openai' (needs OPENAI_KEY, paid)")
     p.add_argument("--review-refresh", action="store_true",
-                   help="ignore the cached LLM review and re-call the API")
+                   help="ignore the cached LLM review and re-run it")
     return p.parse_args(argv)
 
 
@@ -1392,7 +1397,8 @@ def main(argv=None):
     verdicts, keep_flags = None, None
     if args.review:
         verdicts, keep_flags = run_review(
-            profile, items, ref[1], gazetteer, rdir, args.review_refresh)
+            profile, items, ref[1], gazetteer, rdir, args.review_refresh,
+            backend=args.review_backend)
 
     denoise = compute_denoised_metrics(profile, items, n_ref, gazetteer,
                                        keep_flags=keep_flags)
