@@ -1,0 +1,17 @@
+# Derived artifacts & local data — keep the repo code-only
+data/
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS noise
+.DS_Store
+
+# matplotlib / notebook noise
+.ipynb_checkpoints/
+*.ipynb~

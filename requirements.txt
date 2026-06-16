@@ -1,0 +1,8 @@
+# Python dependencies. NOTE: ffmpeg (and ffprobe) is a SYSTEM dependency,
+# install it via your OS package manager (e.g. apt install ffmpeg) — not pip.
+deepgram-sdk==5.3.0
+python-dotenv
+pandas
+matplotlib
+ebooklib          # epub parsing (extract_chapter.py)
+beautifulsoup4    # XHTML parsing (extract_chapter.py)
