@@ -1,154 +1,75 @@
 # Speaking Practice
 
-Daily reading-aloud practice for ML-interview prep: read a book chapter out
-loud, transcribe the recording with Deepgram, and compare it against the
-reference text to surface mispronounced / dropped words and track progress over
-time. English is the default, but the analysis is **language-pluggable** — see
-[Languages](#languages).
+Daily reading-aloud practice for English (ML-interview prep): read a book chapter
+aloud, transcribe it, and compare it against the source text to surface the
+words/sounds to drill and track progress over time. The analysis is
+language-pluggable (English by default; also `generic` and `ja`/`zh`).
 
-## Daily workflow
+## Quick start
 
-1. **Record** yourself reading one chapter aloud. Save it as
-   `data/audio/<chapter label>.wav`, using the **exact** table-of-contents label
-   (e.g. `data/audio/1.1 JUST A BARREL OF MONKEYS.wav`). The label is the join
-   key across every step.
-2. **Extract** the reference text for that chapter from the epub.
-3. **Transcribe** the recording with Deepgram.
-4. **Analyze** transcript vs. reference to score the reading.
-5. **Review** the focus words (errors to drill) and your cumulative progress.
+One session = one chapter. Record yourself reading it and save the audio as
+`data/audio/<chapter label>.wav`, using the **exact** table-of-contents label —
+the label is the join key across every step
+(e.g. `data/audio/1.1 JUST A BARREL OF MONKEYS.wav`). Then, from the project root:
+
+```bash
+python extract_chapter.py "1.1 JUST A BARREL OF MONKEYS"            # reference text from the epub (--list shows all labels)
+python transcribe.py      "1.1 JUST A BARREL OF MONKEYS"            # Deepgram transcription
+python analyze.py         "1.1 JUST A BARREL OF MONKEYS" --review   # score the reading + LLM denoising
+```
+
+Then review `data/reports/<label>/` — start with **`focus_words.csv`** (ranked
+drill list), **`ending_changes.csv`** and **`confusions.csv`** — and
+`data/reports/_progress/` for trends across sessions.
+
+`--review` is safe to re-run: it **resumes** (only un-judged errors are re-sent),
+so if a run doesn't finish in one pass, just run it again until coverage is full.
 
 ## Setup
 
 ```bash
-# Python dependencies
 pip install -r requirements.txt
-
-# System dependency: ffmpeg + ffprobe (must be on PATH)
-sudo apt install ffmpeg          # or your OS package manager
-
-# Deepgram API key
-cp .env.example .env             # then paste your key into .env
-# (you can copy the key from /home/alex/projects/deepgram-stt/.env)
+sudo apt install ffmpeg          # system dependency (ffmpeg + ffprobe); or your OS package manager
+cp .env.example .env             # then add your Deepgram API key (DEEPGRAM_API_KEY)
 ```
 
-## Commands
+`--review` uses your local **Claude subscription** by default (via the Claude
+Agent SDK / authenticated `claude` CLI) — **no API key and no cost**. To use the
+paid OpenAI API instead, set `REVIEW_BACKEND=openai` and `OPENAI_KEY`. Without
+`--review` (or if the backend is unavailable) the analysis still runs and
+denoises using a free, offline name-gazetteer — it never crashes.
 
-All scripts live flat at the project root and take the chapter label as the
-single argument. Run them from the project root.
+## What it measures
 
-```bash
-# 1) Extract the reference chapter text from the epub
-#    (use --list to print every chapter label)
-python extract_chapter.py "1.1 JUST A BARREL OF MONKEYS"
+Every deviation between your reading and the book is classified — omission,
+repetition, insertion, ending-mixup, mispronunciation, substitution — and
+**measurement noise is kept out of the score** so chapters stay comparable:
 
-# 2) Transcribe the recording (needs data/audio/1.1 JUST A BARREL OF MONKEYS.wav)
-python transcribe.py "1.1 JUST A BARREL OF MONKEYS"
+- Invented book names (Sering, Brin, Avrana, …) the recognizer can't know are
+  excluded from the accuracy/WER denominator (listed separately in `names.csv`),
+  never treated as drill targets. Reports show both **raw** and **denoised** scores.
+- With `--review`, an LLM judges each remaining error *with its context* and marks
+  it keep/exclude plus a **cause and reason** (`errors_reviewed.csv`).
+- The headline signals are **ending changes** (dropped `-s`/`-ed`/possessive, e.g.
+  `screens`→`screen`) and **confident confusions** (real-word swaps the ASR clearly
+  heard) — the things that matter most for interviews.
 
-# 3) Analyze transcript vs. reference, write the report, update progress
-python analyze.py "1.1 JUST A BARREL OF MONKEYS"
-```
-
-`transcribe.py` and `analyze.py` both take `--language/-l` (default
-`PRACTICE_LANGUAGE`, falling back to `en`) — see [Languages](#languages).
-
-## Outputs
-
-Everything derived is written under `data/`:
-
-- `data/book/chapters/<label>.txt` — extracted reference text for the chapter.
-- `data/transcripts/<label>/` — per-chapter Deepgram output (JSON + plain text).
-- `data/reports/<label>/` — per-chapter results. CSVs: `errors` (every
-  word-level diff, typed as omission / repetition / insertion / ending-mixup /
-  mispronunciation / substitution), `focus_words` (ranked drill list),
-  `ending_changes` and `confusions` (the two clean headline signals), `names`
-  (invented proper nouns excluded from the metrics), plus `wpm_timeline`,
-  `pauses` and `summary`. PNGs: `error_breakdown`, `focus_words`,
-  `ending_changes`, `confusions`, `confidence_hist`, `wpm_timeline`.
-- `data/reports/_progress/` — cumulative across sessions: `sessions.csv` (one row
-  per chapter) and `progress_*.png` charts tracking accuracy/WER, speech rate,
-  error trends, and the words that recur most often in your focus list.
-
-## Denoising / focus on real errors
-
-The book invents proper nouns (Sering, Brin, Avrana, …) that the ASR cannot
-know and renders as garbage. Those phantom "errors" have no pronunciation
-ground truth, so they inflate the score and crowd out the real issues. To keep
-the numbers honest and comparable across chapters:
-
-- **The phoneme-group chart was removed.** It bucketed errors by *spelling*
-  (e.g. a "th" bucket lumping `through` / `within` / `that`) rather than by the
-  sound that actually changed, so it was misleading.
-- **Names are excluded from the metrics** via a free, offline *gazetteer* —
-  tokens that appear capitalized mid-sentence in several places are treated as
-  invented names. They leave the accuracy/WER denominator entirely (so correctly
-  read names don't inflate the score either) and are reported separately in
-  `names.csv`, never as drill targets. This makes chapters comparable. Reports
-  show both the raw and the **denoised** accuracy / WER.
-- **The headline is the two clean signals:** `ending_changes` (dropped or
-  changed grammatical endings — `screens`→`screen`, `ignored`→`ignores`; these
-  matter for interviews) and `confusions` (confident substitutions of one real
-  word for another, where the ASR — at confidence ≥ 0.85 — clearly heard a
-  different real word).
-
-All of the above runs by default with no API key.
-
-**Opt-in LLM review.** Add `--review` (alias `--llm-review`) to have an LLM judge
-each candidate error *with its context* and mark it keep/exclude plus a cause and
-a short reason, which then drives the denoised metrics:
-
-```bash
-python analyze.py "1.1 JUST A BARREL OF MONKEYS" --review
-python analyze.py "1.1 JUST A BARREL OF MONKEYS" --review --review-refresh  # ignore cache
-```
-
-Two backends (select with `--review-backend` or the `REVIEW_BACKEND` env var):
-
-- **`claude`** (default) — uses your local **Claude subscription** via the Claude
-  Agent SDK (the authenticated `claude` CLI). **No API key and no per-token cost.**
-- **`openai`** — the paid OpenAI API (model `gpt-5.5`, override with `OPENAI_MODEL`);
-  set `OPENAI_KEY` in `.env`.
-
-Verdicts are cached **per item** per chapter, so an interrupted review *resumes*
-(only the un-judged errors are re-sent) and re-runs are cheap. If the chosen
-backend is unavailable it prints a clear message and falls back to the free
-gazetteer — it never crashes.
+Per chapter (`data/reports/<label>/`): `focus_words`, `ending_changes`,
+`confusions`, `errors` (+ `errors_reviewed` with `--review`), `names`, `summary`,
+`wpm_timeline`, `pauses`, and matching PNGs. Cumulative (`data/reports/_progress/`):
+`sessions.csv` plus charts of raw + denoised accuracy/WER, speech rate, and the
+words that recur most in your focus list.
 
 ## Languages
 
-The analysis is language-pluggable. Pass `--language/-l <code>` to
-`transcribe.py` and `analyze.py` (default `config.DEFAULT_LANGUAGE`, set via the
-`PRACTICE_LANGUAGE` env var, falling back to `en`). The code selects a
-**language profile** that drives every language-specific step (tokenizing,
-normalizing, number handling, error classification, sound groups, and the
-reading-rate band); alignment, metrics, CSV, and plotting stay shared.
-
-Built-in profiles:
-
-- **`en`** — full English profile (the original, verified behavior): English
-  inflectional ending-mixups, confusable pairs, the 8 phoneme/sound groups
-  tuned for a Russian-native learner, proper-noun flagging, and word-level
-  rate in **WPM** (comfortable band ~130–160).
-- **`generic`** — any space-separated, Latin-script language. Casefolding,
-  number normalization, and proper-noun flagging are on, but without the
-  English-specific suffix/confusable/phoneme rules (a generic ending heuristic,
-  no sound groups). Word-level rate in WPM (~130–160). Any unknown language code
-  falls back to this profile, using that code as the Deepgram language.
-- **`ja`** (and `zh`) — **character-level** analysis: text is tokenized per
-  significant character, no casefolding/number-normalization/proper-noun
-  flagging, no ending-mixups or sound groups, and the reading rate is reported
-  in **CPM** (characters per minute, comfortable band ~250–400). Word-level
-  Japanese analysis via an optional MeCab tokenizer is a possible future
-  addition — there is intentionally **no mandatory heavy dependency**.
-
-The cumulative `sessions.csv` is language-agnostic and keyed by
-`(chapter, language)`, so the same chapter read in two languages keeps separate
-rows.
-
-To add a language, add a `LanguageProfile` in `languages.py` (and register it in
-`PROFILES`). Reuse the `en`, `generic`, or `ja` profile as a starting point
-depending on whether your language is word- or character-based.
+`transcribe.py` and `analyze.py` take `--language/-l` (default from
+`PRACTICE_LANGUAGE`, else `en`). Profiles live in `languages.py`: `en` (full
+English, rate in WPM), `generic` (any space-separated language; also the fallback
+for unknown codes), and `ja`/`zh` (character-level, rate in CPM). `sessions.csv`
+is keyed by `(chapter, language)`, so the same chapter in two languages stays
+separate. To add a language, add a `LanguageProfile` and register it in `PROFILES`.
 
 ## Repo layout
 
-`data/` is **gitignored** — recordings, transcripts, and reports stay local so
-the committed repository remains code-only.
+`data/` is **gitignored** — recordings, transcripts, and reports stay local; the
+committed repository is code-only.
