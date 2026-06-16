@@ -19,6 +19,10 @@ DEFAULT_EPUB = BOOK_DIR / "Children-of-Time-Adrian-Tchaikovsky.epub"
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 DEFAULT_LANGUAGE = os.getenv("PRACTICE_LANGUAGE", "en")
 
+# OpenAI (only needed for the opt-in 'analyze.py --review' denoising layer).
+OPENAI_KEY = os.getenv("OPENAI_KEY") or os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.5")
+
 
 def ensure_dirs():
     for d in (CHAPTERS_DIR, AUDIO_DIR, TRANSCRIPTS_DIR, REPORTS_DIR, PROGRESS_DIR):

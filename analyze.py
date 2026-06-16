@@ -29,6 +29,10 @@ import pandas as pd
 
 import config
 import languages
+try:
+    import llm_review
+except Exception:                       # module optional; --review degrades
+    llm_review = None
 
 # --------------------------------------------------------------------------- #
 # Constants
@@ -36,6 +40,7 @@ import languages
 LOW_CONF = 0.6
 PAUSE_GAP = 0.5            # seconds: gap > this is counted as a pause
 HESITATION_GAP = 1.0
+CONFIDENT_CONF = 0.85     # >= this ASR confidence => a "confident" real-word confusion
 
 # error categories
 CORRECT = "correct"
@@ -78,6 +83,14 @@ SESSION_COLUMNS = [
     "mispronunciations", "substitutions",
     "overall_rate", "articulation_rate", "mean_confidence",
     "n_pauses", "duration_min",
+    # denoising layer (free gazetteer + opt-in --review). Old rows migrate.
+    "accuracy_denoised", "wer_denoised", "n_names_excluded",
+    "n_ending_changes", "n_confident_confusions", "n_reviewed_excluded",
+]
+# columns added by the denoising layer (migration backfills these on old rows)
+_NEW_SESSION_COLUMNS = [
+    "accuracy_denoised", "wer_denoised", "n_names_excluded",
+    "n_ending_changes", "n_confident_confusions", "n_reviewed_excluded",
 ]
 
 
@@ -559,49 +572,177 @@ def build_note(dom_type, pg):
     return " | ".join(parts) if parts else "review"
 
 
-def build_phoneme_table(profile, items):
-    """Per sound-group word/error counts -> DataFrame + err_rate dict.
+# --------------------------------------------------------------------------- #
+# Denoising layer: name gazetteer, keep/exclude flags, clean headline signals
+# --------------------------------------------------------------------------- #
+def _ref_norm(profile, word):
+    """First normalized form of a reference display word (or '')."""
+    if not word:
+        return ""
+    parts = _normalize_parts(profile, word)
+    return parts[0] if parts else ""
 
-    Returns an empty DataFrame (and {}) when the profile yields no sound groups,
-    so non-EN sessions skip the phoneme outputs entirely.
+
+def is_name_item(profile, it, gazetteer):
+    """True if this error's reference word is an invented/proper NAME.
+
+    A token is a NAME iff its normalized form is in the capitalization gazetteer
+    OR analyze already flagged it is_proper. Insertions/repetitions (no ref word)
+    are never names.
     """
-    stat = {}  # group -> stats; discovered lazily from the profile
-    order = []
+    if it.get("ref_pos") is None:
+        return False
+    if bool(it.get("is_proper")):
+        return True
+    return _ref_norm(profile, it.get("ref_word")) in gazetteer
+
+
+def compute_denoised_metrics(profile, items, n_ref, gazetteer, keep_flags=None):
+    """Denoised accuracy/WER that drop NAME ref tokens from the denominator.
+
+    den = n_ref - (# distinct NAME reference tokens).  errs_denoised = errors
+    with keep!=False (names already force keep=False).  Guards den<=0 -> NaN.
+    keep_flags maps item id (row index in `items`) -> bool; when None (no
+    --review) every non-name error is kept and only names are excluded.
+    `items` MUST be the full alignment (including CORRECT) so correctly-read
+    names are dropped from the denominator too.
+    """
+    # NAME reference tokens to drop from the denominator. Use is_proper OR
+    # gazetteer, evaluated per distinct ref position so each token counts once.
+    name_ref_positions = set()
     for it in items:
-        if it["ref_pos"] is None:
+        if it.get("ref_pos") is not None and is_name_item(profile, it, gazetteer):
+            name_ref_positions.add(it["ref_pos"])
+    n_names = len(name_ref_positions)
+
+    # Count kept errors by category so the denoised numerators match the raw
+    # definitions in compute_metrics: accuracy loses only S+D from the
+    # numerator (insertions/repetitions consume no ref token); WER counts
+    # S+D+I (repetitions excluded). This makes denoised == raw exactly when
+    # n_names == 0 and no keep_flags exclude anything.
+    kept_sub = 0   # substitutions (ENDING + MISP + SUBST)
+    kept_del = 0   # deletions (OMISSION)
+    kept_ins = 0   # insertions (INSERTION); REPETITION counts toward neither
+    name_errs = 0
+    for i, it in enumerate(items):
+        if it["type"] == CORRECT:
             continue
-        norm = _normalize_parts(profile, it["ref_word"])
-        norm = norm[0] if norm else ""
-        if not norm:
+        name = is_name_item(profile, it, gazetteer)
+        if name:
+            name_errs += 1
+        if keep_flags is not None:
+            kept = keep_flags.get(i, True) and not name
+        else:
+            kept = not name
+        if not kept:
             continue
-        is_err = it["type"] != CORRECT
-        for g in profile.sound_groups_for(norm, norm):
-            if g not in stat:
-                stat[g] = {"words": set(), "errs": 0, "confs": [], "examples": []}
-                order.append(g)
-            s = stat[g]
-            s["words"].add(norm)
-            if it["confidence"] is not None:
-                s["confs"].append(it["confidence"])
-            if is_err:
-                s["errs"] += 1
-                if norm not in s["examples"] and len(s["examples"]) < 5:
-                    s["examples"].append(norm)
-    rows, err_rates = [], {}
-    for g in order:
-        s = stat[g]
-        nw = len(s["words"])
-        ne = s["errs"]
-        mc = sum(s["confs"]) / len(s["confs"]) if s["confs"] else float("nan")
-        err_rates[g] = (ne / nw) if nw else 0.0
+        if it["type"] in (ENDING, MISP, SUBST):
+            kept_sub += 1
+        elif it["type"] == OMISSION:
+            kept_del += 1
+        elif it["type"] == INSERTION:
+            kept_ins += 1
+        # REPETITION: contributes to neither accuracy nor WER (matches raw)
+    errs_denoised = kept_sub + kept_del + kept_ins
+    den = n_ref - n_names
+    if den <= 0:
+        acc_d = float("nan")
+        wer_d = float("nan")
+    else:
+        acc_d = (den - (kept_sub + kept_del)) / den
+        wer_d = (kept_sub + kept_del + kept_ins) / den
+    return {
+        "n_names_excluded": n_names, "name_errs": name_errs,
+        "errs_denoised": errs_denoised, "den": den,
+        "accuracy_denoised": acc_d, "wer_denoised": wer_d,
+    }
+
+
+def build_ending_changes(profile, items, gazetteer):
+    """ending_mixup items on non-name words -> DataFrame (the clean signal)."""
+    rows = []
+    for it in items:
+        if it["type"] != ENDING:
+            continue
+        if is_name_item(profile, it, gazetteer):
+            continue
         rows.append({
-            "group": g, "n_words": nw, "n_errors": ne,
-            "mean_confidence": round(mc, 4) if not math.isnan(mc) else "",
-            "example_words": ",".join(s["examples"]),
+            "ref_word": it["ref_word"], "hyp_word": it["hyp_word"],
+            "ref_pos": it["ref_pos"], "time_start": it["time_start"],
+            "confidence": (round(it["confidence"], 4)
+                           if it["confidence"] is not None else ""),
+        })
+    return pd.DataFrame(rows, columns=[
+        "ref_word", "hyp_word", "ref_pos", "time_start", "confidence"])
+
+
+def build_confusions(profile, items, gazetteer):
+    """Confident real-word confusions: substitution/mispronunciation on
+    non-name words with ASR confidence >= CONFIDENT_CONF -> DataFrame."""
+    rows = []
+    for it in items:
+        if it["type"] not in (SUBST, MISP):
+            continue
+        if is_name_item(profile, it, gazetteer):
+            continue
+        c = it["confidence"]
+        if c is None or c < CONFIDENT_CONF:
+            continue
+        rows.append({
+            "ref_word": it["ref_word"], "hyp_word": it["hyp_word"],
+            "type": it["type"], "ref_pos": it["ref_pos"],
+            "time_start": it["time_start"], "confidence": round(c, 4),
         })
     df = pd.DataFrame(rows, columns=[
-        "group", "n_words", "n_errors", "mean_confidence", "example_words"])
-    return df, err_rates
+        "ref_word", "hyp_word", "type", "ref_pos", "time_start", "confidence"])
+    if not df.empty:
+        df = df.sort_values("confidence", ascending=False).reset_index(drop=True)
+    return df
+
+
+def split_focus_names(profile, fdf, gazetteer):
+    """Split focus_words into (clean, names). Names = is_proper OR gazetteer."""
+    if fdf.empty:
+        return fdf, fdf
+    name_mask = fdf["is_proper"].astype(bool) | fdf["word"].apply(
+        lambda w: str(w) in gazetteer)
+    return fdf[~name_mask].reset_index(drop=True), fdf[name_mask].reset_index(drop=True)
+
+
+def plot_ending_changes(path, label, edf):
+    fig, ax = plt.subplots(figsize=(9, 5))
+    if edf.empty:
+        ax.text(0.5, 0.5, "no ending changes - clean read!",
+                ha="center", va="center", transform=ax.transAxes)
+    else:
+        labels = [f"{r.ref_word}->{r.hyp_word}" for r in edf.head(15).itertuples()]
+        labels = labels[::-1]
+        ax.barh(range(len(labels)), [1] * len(labels), color="#9467bd")
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xticks([])
+    ax.set_title(f"Ending changes (-s/-ed/-ing) - {label}")
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+def plot_confusions(path, label, cdf):
+    fig, ax = plt.subplots(figsize=(9, 5))
+    if cdf.empty:
+        ax.text(0.5, 0.5, "no confident confusions",
+                ha="center", va="center", transform=ax.transAxes)
+    else:
+        top = cdf.head(15).iloc[::-1]
+        labels = [f"{r.ref_word}->{r.hyp_word}" for r in top.itertuples()]
+        ax.barh(range(len(labels)), top["confidence"].tolist(), color="#d62728")
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xlabel("ASR confidence")
+    ax.set_title(f"Confident real-word confusions - {label}")
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
 
 
 # --------------------------------------------------------------------------- #
@@ -700,16 +841,35 @@ def build_sentence_hotspots(profile, body, items, session_rate):
 # --------------------------------------------------------------------------- #
 # CSV writers
 # --------------------------------------------------------------------------- #
-def write_errors_csv(path, items):
-    rows = [{
-        "idx": i, "ref_word": it["ref_word"], "hyp_word": it["hyp_word"],
-        "type": it["type"], "ref_pos": it["ref_pos"], "hyp_pos": it["hyp_pos"],
-        "time_start": it["time_start"], "confidence": it["confidence"],
-        "is_proper": bool(it.get("is_proper")),
-    } for i, it in enumerate(it2 for it2 in items if it2["type"] != CORRECT)]
-    pd.DataFrame(rows, columns=[
-        "idx", "ref_word", "hyp_word", "type", "ref_pos", "hyp_pos",
-        "time_start", "confidence", "is_proper"]).to_csv(path, index=False)
+def error_items(items):
+    """The non-CORRECT items in errors.csv row order (id == enumerate index)."""
+    return [it for it in items if it["type"] != CORRECT]
+
+
+def write_errors_csv(path, items, verdicts=None):
+    """Write errors.csv. When ``verdicts`` (id -> {keep,cause,reason}) is given
+    (i.e. --review ran) ADD keep,cause,reason columns; otherwise the schema is
+    byte-for-byte the legacy one (default output stays unchanged)."""
+    cols = ["idx", "ref_word", "hyp_word", "type", "ref_pos", "hyp_pos",
+            "time_start", "confidence", "is_proper"]
+    rows = []
+    for i, it in enumerate(error_items(items)):
+        r = {
+            "idx": i, "ref_word": it["ref_word"], "hyp_word": it["hyp_word"],
+            "type": it["type"], "ref_pos": it["ref_pos"],
+            "hyp_pos": it["hyp_pos"], "time_start": it["time_start"],
+            "confidence": it["confidence"],
+            "is_proper": bool(it.get("is_proper")),
+        }
+        if verdicts is not None:
+            v = verdicts.get(i, {})
+            r["keep"] = bool(v.get("keep", True))
+            r["cause"] = v.get("cause", "")
+            r["reason"] = v.get("reason", "")
+        rows.append(r)
+    if verdicts is not None:
+        cols = cols + ["keep", "cause", "reason"]
+    pd.DataFrame(rows, columns=cols).to_csv(path, index=False)
 
 
 def write_summary_csv(path, label, profile, metrics, rate):
@@ -835,32 +995,24 @@ def plot_confidence_hist(path, label, items):
     plt.close(fig)
 
 
-def plot_phoneme_groups(path, label, pdf):
-    fig, ax = plt.subplots(figsize=(8, 4))
-    if pdf.empty or pdf["n_words"].sum() == 0:
-        ax.text(0.5, 0.5, "no phoneme-group data", ha="center", va="center",
-                transform=ax.transAxes)
-    else:
-        rates = [(r["n_errors"] / r["n_words"] if r["n_words"] else 0.0)
-                 for _, r in pdf.iterrows()]
-        ax.bar(pdf["group"], rates, color="#8c564b")
-        ax.set_ylabel("error rate (errors / words)")
-        plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
-    ax.set_title(f"Phoneme-group error rate - {label}")
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-
-
 # --------------------------------------------------------------------------- #
 # Cumulative progress
 # --------------------------------------------------------------------------- #
-def upsert_session(label, profile, metrics, rate):
+def _round_or_nan(v):
+    return round(v, 4) if v is not None and not math.isnan(v) else ""
+
+
+def upsert_session(label, profile, metrics, rate, denoise=None):
     """Append/replace this (chapter, language) row in the language-agnostic
-    sessions.csv. Migrates a legacy (err_rate_* / n_ref_words / overall_wpm)
-    schema on read so old rows survive the new columns.
+    sessions.csv. Migrates a legacy schema on read (err_rate_* / n_ref_words /
+    overall_wpm) AND backfills the new denoising columns so old rows survive.
+
+    ``denoise`` is the dict from compute_denoised_metrics (+ extra signal
+    counts: n_ending_changes, n_confident_confusions, n_reviewed_excluded).
+    When None, denoised columns fall back to the raw accuracy/WER.
     """
     config.ensure_dirs()
+    d = denoise or {}
     row = {
         "date": datetime.date.today().isoformat(),
         "chapter": label,
@@ -880,6 +1032,14 @@ def upsert_session(label, profile, metrics, rate):
                             if not math.isnan(metrics["mean_confidence"]) else ""),
         "n_pauses": rate["n_pauses"],
         "duration_min": round(rate["minutes"], 3),
+        "accuracy_denoised": _round_or_nan(d.get("accuracy_denoised"))
+        if denoise else round(metrics["accuracy"], 4),
+        "wer_denoised": _round_or_nan(d.get("wer_denoised"))
+        if denoise else round(metrics["wer"], 4),
+        "n_names_excluded": d.get("n_names_excluded", 0),
+        "n_ending_changes": d.get("n_ending_changes", 0),
+        "n_confident_confusions": d.get("n_confident_confusions", 0),
+        "n_reviewed_excluded": d.get("n_reviewed_excluded", 0),
     }
 
     if config.SESSIONS_CSV.exists():
@@ -917,6 +1077,20 @@ def _migrate_sessions(df):
         df = df.drop(columns=drop)
     if "language" not in df.columns:
         df["language"] = "en"     # legacy rows were English-only
+    # backfill the denoising columns on rows that predate them
+    for c in _NEW_SESSION_COLUMNS:
+        if c not in df.columns:
+            df[c] = pd.NA
+    if "accuracy" in df.columns:
+        ad = pd.to_numeric(df["accuracy_denoised"], errors="coerce")
+        df["accuracy_denoised"] = ad.fillna(pd.to_numeric(df["accuracy"],
+                                                           errors="coerce"))
+    if "wer" in df.columns:
+        wd = pd.to_numeric(df["wer_denoised"], errors="coerce")
+        df["wer_denoised"] = wd.fillna(pd.to_numeric(df["wer"], errors="coerce"))
+    for c in ("n_names_excluded", "n_ending_changes",
+              "n_confident_confusions", "n_reviewed_excluded"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
     return df
 
 
@@ -995,46 +1169,49 @@ def plot_progress(df, profile):
     plt.close(fig)
 
 
-def plot_progress_phoneme_groups():
-    """Per-group error-rate trend, rebuilt by re-reading every session's
-    phoneme_groups.csv (sound-group rates are no longer stored in sessions.csv).
+def plot_progress_denoised(df):
+    """Denoised accuracy/WER trend + ending-changes trend over sessions.
 
-    Aggregates all chapters' EN csvs regardless of the current run's language;
-    that is fine since non-EN sessions never write that csv. Skips silently if
-    no phoneme_groups.csv exists.
+    Replaces the dropped phoneme-group trend. Reads the denoising columns from
+    sessions.csv (migrated/backfilled), so it works on mixed old+new rows.
     """
-    glob = sorted(config.REPORTS_DIR.glob("*/phoneme_groups.csv"))
-    series = {}  # group -> list of (key, err_rate)
-    for pcsv in glob:
-        try:
-            d = pd.read_csv(pcsv)
-        except Exception:
-            continue
-        if d.empty or "group" not in d.columns:
-            continue
-        key = pcsv.parent.name
-        for _, r in d.iterrows():
-            nw = float(r.get("n_words", 0) or 0)
-            ne = float(r.get("n_errors", 0) or 0)
-            rate = (ne / nw) if nw else 0.0
-            series.setdefault(str(r["group"]), []).append((key, rate))
-    if not series:
+    if df.empty:
         return
-    keys = sorted({k for pts in series.values() for k, _ in pts})
-    xidx = {k: i for i, k in enumerate(keys)}
+    df = df.sort_values("date").reset_index(drop=True)
+    x = list(range(len(df)))
+    xlabels = [f"{d}\n{c[:18]}" for d, c in zip(df["date"], df["chapter"])]
+
+    # denoised accuracy & WER (vs raw, so the gain from denoising is visible)
     fig, ax = plt.subplots(figsize=(10, 4))
-    for g, pts in series.items():
-        pts = sorted(pts, key=lambda kv: xidx[kv[0]])
-        xs = [xidx[k] for k, _ in pts]
-        ys = [v for _, v in pts]
-        ax.plot(xs, ys, "-o", ms=3, label=g)
-    ax.set_xticks(list(range(len(keys))))
-    ax.set_xticklabels([k[:18] for k in keys], fontsize=7, rotation=0)
-    ax.set_ylabel("error rate")
-    ax.set_title("Progress: phoneme-group error rate trend")
-    ax.legend(fontsize=7, ncol=4)
+    acc = pd.to_numeric(df.get("accuracy"), errors="coerce")
+    accd = pd.to_numeric(df.get("accuracy_denoised"), errors="coerce")
+    werd = pd.to_numeric(df.get("wer_denoised"), errors="coerce")
+    ax.plot(x, acc, "-o", color="green", alpha=0.4, label="accuracy (raw)")
+    ax.plot(x, accd, "-o", color="green", label="accuracy (denoised)")
+    ax.plot(x, werd, "-o", color="red", label="WER (denoised)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(xlabels, fontsize=7, rotation=0)
+    ax.set_ylabel("rate")
+    ax.set_title("Progress: denoised accuracy & WER over sessions")
+    ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(config.PROGRESS_DIR / "progress_phoneme_groups.png", dpi=120)
+    fig.savefig(config.PROGRESS_DIR / "progress_denoised.png", dpi=120)
+    plt.close(fig)
+
+    # ending-changes trend (the clean grammatical-ending signal)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    end = pd.to_numeric(df.get("n_ending_changes"), errors="coerce").fillna(0)
+    conf = pd.to_numeric(df.get("n_confident_confusions"),
+                         errors="coerce").fillna(0)
+    ax.plot(x, end, "-o", color="#9467bd", label="ending changes")
+    ax.plot(x, conf, "-o", color="#d62728", label="confident confusions")
+    ax.set_xticks(x)
+    ax.set_xticklabels(xlabels, fontsize=7, rotation=0)
+    ax.set_ylabel("count")
+    ax.set_title("Progress: clean signals (ending changes, confusions)")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(config.PROGRESS_DIR / "progress_clean_signals.png", dpi=120)
     plt.close(fig)
 
 
@@ -1081,6 +1258,72 @@ def plot_progress_focus_words():
 
 
 # --------------------------------------------------------------------------- #
+# LLM review orchestration (opt-in --review)
+# --------------------------------------------------------------------------- #
+def run_review(profile, items, ref_disp, gazetteer, rdir, refresh):
+    """Run llm_review over the error items and return (verdicts, keep_flags).
+
+    verdicts: id (errors.csv row index) -> {keep,cause,reason}.
+    keep_flags: full-`items` index -> keep bool (for compute_denoised_metrics).
+
+    Gazetteer names ALWAYS force keep=False (proper_noun_artifact). The LLM wins
+    on non-names. Any id the LLM omits defaults keep=True (safe in-vocab). If the
+    key/module is unavailable, returns ({}, gazetteer-only keep_flags) and the
+    caller proceeds on the free path; never raises.
+    """
+    errs = error_items(items)
+    # build the review payload for non-name errors only (names are forced noise)
+    review_input = []
+    name_ids = set()
+    for i, it in enumerate(errs):
+        if is_name_item(profile, it, gazetteer):
+            name_ids.add(i)
+            continue
+        review_input.append({
+            "id": i, "type": it["type"], "ref_word": it.get("ref_word"),
+            "hyp_word": it.get("hyp_word"), "confidence": it.get("confidence"),
+            "ref_pos": it.get("ref_pos"),
+        })
+
+    verdicts = {}
+    if llm_review is not None and getattr(config, "OPENAI_KEY", None):
+        try:
+            cache = rdir / ".review_cache.json"
+            verdicts = llm_review.review_errors(
+                review_input, ref_disp,
+                model=getattr(config, "OPENAI_MODEL", None),
+                cache_path=str(cache), refresh=refresh) or {}
+        except Exception as exc:                       # never crash analysis
+            print(f"WARNING: LLM review failed ({exc}); "
+                  "falling back to free name-gazetteer denoising")
+            verdicts = {}
+    else:
+        print("OPENAI_KEY not set; falling back to free name-gazetteer denoising")
+
+    # normalize verdict keys to int ids; fill defaults; force names to exclude
+    norm_verdicts = {}
+    for i, it in enumerate(errs):
+        if i in name_ids:
+            norm_verdicts[i] = {"keep": False, "cause": "proper_noun_artifact",
+                                "reason": "invented book name (gazetteer)"}
+            continue
+        v = verdicts.get(i) or verdicts.get(str(i)) or {}
+        norm_verdicts[i] = {
+            "keep": bool(v.get("keep", True)),
+            "cause": v.get("cause", ""),
+            "reason": v.get("reason", ""),
+        }
+
+    # map errors.csv ids -> full items indices for keep_flags
+    err_index_to_full = [idx for idx, it in enumerate(items)
+                         if it["type"] != CORRECT]
+    keep_flags = {}
+    for i, full_idx in enumerate(err_index_to_full):
+        keep_flags[full_idx] = norm_verdicts[i]["keep"]
+    return norm_verdicts, keep_flags
+
+
+# --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
 def parse_args(argv):
@@ -1096,6 +1339,12 @@ def parse_args(argv):
     p.add_argument("--label", help="override label for output dirs/progress key")
     p.add_argument("--no-progress", action="store_true",
                    help="do not append/update the cumulative sessions row")
+    p.add_argument("--review", "--llm-review", dest="review",
+                   action="store_true",
+                   help="opt-in: use OpenAI to mark each error keep/exclude "
+                        "(needs OPENAI_KEY; falls back to the free gazetteer)")
+    p.add_argument("--review-refresh", action="store_true",
+                   help="ignore the cached LLM review and re-call the API")
     return p.parse_args(argv)
 
 
@@ -1127,14 +1376,45 @@ def main(argv=None):
     rate = compute_speech_rate(hyp, n_correct_ref)
 
     fdf = build_focus_words(profile, items)
-    pdf, err_rates = build_phoneme_table(profile, items)
-    has_sound_groups = not pdf.empty
     para_df = build_paragraphs(profile, body, items, rate)
     sent_df = build_sentence_hotspots(profile, body, items, rate["overall_rate"])
 
+    # ---- denoising layer (free name gazetteer; default for every run) ----
+    if llm_review is not None:
+        try:
+            gazetteer = set(llm_review.build_name_gazetteer(body))
+        except Exception:
+            gazetteer = set()
+    else:
+        gazetteer = set()
+
+    # opt-in LLM review: per-item keep/exclude verdicts (cached, graceful)
+    verdicts, keep_flags = None, None
+    if args.review:
+        verdicts, keep_flags = run_review(
+            profile, items, ref[1], gazetteer, rdir, args.review_refresh)
+
+    denoise = compute_denoised_metrics(profile, items, n_ref, gazetteer,
+                                       keep_flags=keep_flags)
+    edf = build_ending_changes(profile, items, gazetteer)
+    cdf = build_confusions(profile, items, gazetteer)
+    clean_fdf, names_fdf = split_focus_names(profile, fdf, gazetteer)
+    denoise["n_ending_changes"] = len(edf)
+    denoise["n_confident_confusions"] = len(cdf)
+    if keep_flags is not None:
+        denoise["n_reviewed_excluded"] = sum(1 for v in keep_flags.values()
+                                             if not v)
+
     # ---- CSV reports ----
-    write_errors_csv(rdir / "errors.csv", items)
-    fdf.drop(columns=["_dom_type"]).to_csv(rdir / "focus_words.csv", index=False)
+    write_errors_csv(rdir / "errors.csv", items, verdicts=verdicts)
+    if verdicts is not None:                       # cache the reviewed copy too
+        write_errors_csv(rdir / "errors_reviewed.csv", items, verdicts=verdicts)
+    clean_fdf.drop(columns=["_dom_type"], errors="ignore").to_csv(
+        rdir / "focus_words.csv", index=False)
+    names_fdf.drop(columns=["_dom_type"], errors="ignore").to_csv(
+        rdir / "names.csv", index=False)
+    edf.to_csv(rdir / "ending_changes.csv", index=False)
+    cdf.to_csv(rdir / "confusions.csv", index=False)
     pd.DataFrame(rate["timeline"],
                  columns=["t_start", "t_end", "rate", "n_units"]
                  ).to_csv(rdir / "wpm_timeline.csv", index=False)
@@ -1142,8 +1422,6 @@ def main(argv=None):
                  columns=["start", "end", "duration", "after_word"]
                  ).to_csv(rdir / "pauses.csv", index=False)
     write_summary_csv(rdir / "summary.csv", label, profile, metrics, rate)
-    if has_sound_groups:
-        pdf.to_csv(rdir / "phoneme_groups.csv", index=False)
     para_df.to_csv(rdir / "paragraphs.csv", index=False)
     sent_df.to_csv(rdir / "sentence_hotspots.csv", index=False)
 
@@ -1151,38 +1429,48 @@ def main(argv=None):
     if n_ref > 0:
         plot_rate_timeline(rdir / "wpm_timeline.png", label, profile, rate)
         plot_error_breakdown(rdir / "error_breakdown.png", label, metrics)
-        plot_focus_words(rdir / "focus_words.png", label, fdf)
+        plot_focus_words(rdir / "focus_words.png", label, clean_fdf)
+        plot_ending_changes(rdir / "ending_changes.png", label, edf)
+        plot_confusions(rdir / "confusions.png", label, cdf)
         plot_confidence_hist(rdir / "confidence_hist.png", label, items)
-        if has_sound_groups:
-            plot_phoneme_groups(rdir / "phoneme_groups.png", label, pdf)
 
     # ---- progress ----
     if not args.no_progress:
-        sdf = upsert_session(label, profile, metrics, rate)
+        sdf = upsert_session(label, profile, metrics, rate, denoise=denoise)
         plot_progress(sdf, profile)
         plot_progress_focus_words()
-        if has_sound_groups:
-            plot_progress_phoneme_groups()
+        plot_progress_denoised(sdf)
 
     # ---- console summary ----
-    drill = fdf[~fdf["is_proper"]] if not fdf.empty else fdf
-    top5 = drill.head(5)["word"].tolist() if not drill.empty else []
-    top_groups = (pdf.sort_values("n_errors", ascending=False).head(3)["group"].tolist()
-                  if not pdf.empty else [])
+    top5 = clean_fdf.head(5)["word"].tolist() if not clean_fdf.empty else []
     worst_sent = sent_df.iloc[0]["preview"] if not sent_df.empty else "(none)"
     mc = metrics["mean_confidence"]
     unit = profile.rate_unit_label
+    accd = denoise["accuracy_denoised"]
+    werd = denoise["wer_denoised"]
+    accd_s = "n/a" if math.isnan(accd) else f"{accd*100:.1f}%"
+    werd_s = "n/a" if math.isnan(werd) else f"{werd*100:.1f}%"
     print(f"== {label} ({profile.name}) ==")
     print(f"scored ref {profile.unit}s : {n_ref}")
-    print(f"accuracy         : {metrics['accuracy']*100:.1f}%")
-    print(f"WER              : {metrics['wer']*100:.1f}%")
+    print(f"accuracy         : {metrics['accuracy']*100:.1f}% "
+          f"(denoised {accd_s})")
+    print(f"WER              : {metrics['wer']*100:.1f}% "
+          f"(denoised {werd_s})")
+    print(f"names excluded   : {denoise['n_names_excluded']}")
     print(f"overall {unit:<8} : {rate['overall_rate']:.0f} "
           f"(articulation {rate['articulation_rate']:.0f})")
     print(f"mean confidence  : {('%.3f' % mc) if not math.isnan(mc) else 'n/a'}")
     print(f"pauses           : {rate['n_pauses']} "
           f"(longest {rate['longest_pause']:.1f}s)")
     print(f"top focus words  : {', '.join(top5) if top5 else '(none)'}")
-    print(f"top sound groups : {', '.join(top_groups) if top_groups else '(none)'}")
+    print(f"ending changes   : {len(edf)}")
+    print(f"confident confus.: {len(cdf)}")
+    if keep_flags is not None:
+        n_excl = denoise.get("n_reviewed_excluded", 0)
+        examples = [v["reason"] for v in (verdicts or {}).values()
+                    if not v["keep"] and v["reason"]][:3]
+        print(f"review excluded  : {n_excl}"
+              + (f" (e.g. {'; '.join(examples)})" if examples else ""))
     print(f"worst sentence   : {worst_sent}")
     print(f"output dir       : {rdir}")
 

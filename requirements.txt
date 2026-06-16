@@ -6,3 +6,5 @@ pandas
 matplotlib
 ebooklib          # epub parsing (extract_chapter.py)
 beautifulsoup4    # XHTML parsing (extract_chapter.py)
+openai>=1.50      # opt-in LLM error review (analyze.py --review)
+pydantic>=2.0     # strict JSON schema for the LLM review
