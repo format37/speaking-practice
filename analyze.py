@@ -1149,20 +1149,32 @@ def plot_progress(df, profile):
     fig.savefig(config.PROGRESS_DIR / "progress_wpm.png", dpi=120)
     plt.close(fig)
 
-    # stacked errors
+    # stacked errors, normalized PER 100 REFERENCE WORDS so chapters of different
+    # lengths are comparable (raw counts conflate "how much you read" with "how
+    # well you read"). Numerator and denominator are both raw reference words, and
+    # each bar is annotated with the chapter's word count for length context.
     fig, ax = plt.subplots(figsize=(10, 4))
+    nref = pd.to_numeric(df["n_ref_units"], errors="coerce")
+    denom = nref.where(nref > 0)            # NaN where 0/missing -> that bar reads 0
     bottom = [0.0] * len(df)
+    totals = [0.0] * len(df)
     cats = ["omissions", "insertions", "repetitions", "ending_mixups",
             "mispronunciations", "substitutions"]
     palette = ["#7f7f7f", "#1f77b4", "#e377c2", "#9467bd", "#ff7f0e", "#d62728"]
     for cat, col in zip(cats, palette):
-        vals = pd.to_numeric(df[cat], errors="coerce").fillna(0).tolist()
-        ax.bar(x, vals, bottom=bottom, label=cat, color=col)
-        bottom = [b + v for b, v in zip(bottom, vals)]
+        cnt = pd.to_numeric(df[cat], errors="coerce").fillna(0)
+        rate = (cnt / denom * 100).fillna(0).tolist()
+        ax.bar(x, rate, bottom=bottom, label=cat, color=col)
+        bottom = [b + v for b, v in zip(bottom, rate)]
+        totals = [t + v for t, v in zip(totals, rate)]
+    for xi, total, n in zip(x, totals, nref.fillna(0).tolist()):
+        if n > 0:
+            ax.annotate(f"{int(n)}w", xy=(xi, total), ha="center", va="bottom",
+                        fontsize=6, color="#444")
     ax.set_xticks(x)
     ax.set_xticklabels(xlabels, fontsize=7)
-    ax.set_ylabel("error count")
-    ax.set_title("Progress: error categories per session")
+    ax.set_ylabel("errors per 100 reference words")
+    ax.set_title("Progress: error categories per session (per 100 words)")
     ax.legend(fontsize=7, ncol=3)
     fig.tight_layout()
     fig.savefig(config.PROGRESS_DIR / "progress_errors.png", dpi=120)
