@@ -13,10 +13,15 @@ the label is the join key across every step
 (e.g. `data/audio/1.1 JUST A BARREL OF MONKEYS.wav`). Then, from the project root:
 
 ```bash
-python extract_chapter.py "1.1 JUST A BARREL OF MONKEYS"            # reference text from the epub (--list shows all labels)
-python transcribe.py      "1.1 JUST A BARREL OF MONKEYS"            # Deepgram transcription
-python analyze.py         "1.1 JUST A BARREL OF MONKEYS" --review   # score the reading + LLM denoising
+./run.sh "1.1 JUST A BARREL OF MONKEYS"
 ```
+
+That chains the three steps — extract the chapter text from the epub, transcribe
+the recording with Deepgram, then analyze it with `--review` (LLM denoising). It
+skips transcription if a transcript already exists (`FORCE=1` to redo) and
+forwards extra flags to `analyze` (e.g. `./run.sh "1.1 …" --review-refresh`). To
+run a step on its own, call `python extract_chapter.py` / `transcribe.py` /
+`analyze.py` directly (use `python extract_chapter.py --list` to see chapter labels).
 
 Then review `data/reports/<label>/` — start with **`focus_words.csv`** (ranked
 drill list), **`ending_changes.csv`** and **`confusions.csv`** — and
