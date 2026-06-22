@@ -1,14 +1,22 @@
-"""Extract a chapter's reference text from the book epub.
+"""Extract a chapter's reference text from the active book.
 
-Reads the table of contents to map a human-readable chapter label
-(e.g. "1.1 JUST A BARREL OF MONKEYS") to its XHTML document, then writes the
-chapter as plain text to the active book's chapters/<label>.txt with the title
-as the first line followed by the prose body. analyze.py's load_reference()
-treats the first non-empty line as the title (dropped from scoring) and the
-rest as body. The source epub is the (single) *.epub in the active book folder.
+The source is auto-detected from the active book folder:
+
+* **epub** (a ``*.epub`` is present): read the table of contents to map a
+  human-readable chapter label (e.g. "1.1 JUST A BARREL OF MONKEYS") to its
+  XHTML document and extract that chapter's prose.
+* **txt** (no epub, a top-level ``*.txt``): treat the whole file as a single
+  "chapter" — for short texts read in one pass. The label is the txt's stem.
+
+Either way the chapter is written to the active book's chapters/<label>.txt
+with the title as the first line followed by the body. analyze.py's
+load_reference() treats the first non-empty line as the title (dropped from
+scoring) and the rest as body; for txt the synthetic title line is the label,
+so the entire text is kept as scored body.
 
 Usage:
-    python extract_chapter.py "1.1 JUST A BARREL OF MONKEYS"
+    python extract_chapter.py "1.1 JUST A BARREL OF MONKEYS"   # epub: by label
+    python extract_chapter.py                                  # txt: whole file
     python extract_chapter.py --list        # print every chapter label
     python extract_chapter.py --all         # extract every chapter
     # --student/--book override the active ./use selection for one run.
@@ -103,6 +111,54 @@ def resolve_label(pairs, label):
     return None
 
 
+def extract_txt(txt_path):
+    """Whole txt as a single chapter; returns (label, output_path).
+
+    The label is the txt's stem (it must match the audio file's stem). The body
+    is the entire file, with the label written as a synthetic title line so
+    analyze.load_reference() keeps every line as scored body.
+    """
+    label = txt_path.stem
+    body = txt_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not body:
+        sys.exit(f"ERROR: txt file is empty: {txt_path}")
+    out = write_chapter(label, label, body)   # title == label -> dropped, body kept
+    return label, out
+
+
+def run_txt_mode(args, txts):
+    """Handle a txt-source book (--list / --all / single)."""
+    if args.list:
+        for t in txts:
+            print(t.stem)
+        return
+    if args.all:
+        for t in txts:
+            label, out = extract_txt(t)
+            print(f"wrote {out}  ({len(out.read_text(encoding='utf-8'))} chars)")
+        return
+
+    # Single text. With one txt the label is its stem regardless of any arg
+    # (the label must match the audio stem). With several, an arg selects one.
+    if len(txts) == 1:
+        chosen = txts[0]
+        if args.label and args.label != chosen.stem:
+            print(f"note: book has a single text; using {chosen.stem!r} "
+                  f"(ignoring label {args.label!r})")
+    else:
+        chosen = next((t for t in txts if t.stem == args.label), None)
+        if chosen is None:
+            avail = ", ".join(t.stem for t in txts)
+            sys.exit(f"ERROR: multiple texts; pass one of: {avail}"
+                     if not args.label else
+                     f"ERROR: no text named {args.label!r}; available: {avail}")
+
+    label, out = extract_txt(chosen)
+    print(f"Extracted {label!r} (whole text)")
+    print(f"  chars: {len(out.read_text(encoding='utf-8'))}")
+    print(f"  wrote: {out}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract chapter reference text from the book epub."
@@ -121,8 +177,22 @@ def main():
     # that writes into the book folder needs the active (student, book) context.
     config.activate(args.student, args.book, require=args.epub is None)
 
-    epub_path = Path(args.epub) if args.epub else config.DEFAULT_EPUB
-    if epub_path is None or not epub_path.exists():
+    # Pick the source: an explicit --epub, else the active book's *.epub, else
+    # its top-level *.txt (whole-text mode). epub wins when both are present.
+    if args.epub:
+        epub_path = Path(args.epub)
+    else:
+        epubs, txts = config.book_sources()
+        if not epubs and txts:
+            run_txt_mode(args, txts)
+            return
+        epub_path = config.DEFAULT_EPUB
+        if epub_path is None or not epub_path.exists():
+            sys.exit(f"ERROR: no .epub or .txt found in the active book folder: "
+                     f"{config.BOOK_DIR}\n  add a .epub (chapter mode) or a "
+                     f".txt (whole-text mode).")
+
+    if not epub_path.exists():
         sys.exit(f"ERROR: epub not found: {epub_path}")
 
     book = epub.read_epub(str(epub_path))

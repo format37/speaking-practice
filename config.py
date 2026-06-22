@@ -260,6 +260,38 @@ def report_dir(label):      _require_active(); return REPORTS_DIR / label
 
 
 # --------------------------------------------------------------------------- #
+# Book source kind (epub vs. plain txt)
+# --------------------------------------------------------------------------- #
+def book_sources():
+    """``(epubs, root_txts)`` in the active book dir.
+
+    ``root_txts`` are top-level ``*.txt`` only — the extracted ``chapters/*.txt``
+    live one level down and are not source files.
+    """
+    _require_active()
+    return sorted(BOOK_DIR.glob("*.epub")), sorted(BOOK_DIR.glob("*.txt"))
+
+
+def book_kind():
+    """``'epub'``, ``'txt'``, or ``'empty'`` for the active book (epub wins)."""
+    epubs, txts = book_sources()
+    return "epub" if epubs else "txt" if txts else "empty"
+
+
+def default_label():
+    """Auto chapter label for a single-source txt book (its txt stem), else None.
+
+    A short whole-text book (one ``*.txt``, no epub) has exactly one "chapter",
+    so ``./run`` / run.sh can resolve the label with no argument. epub books and
+    multi-txt books return ``None`` — a label is required there.
+    """
+    epubs, txts = book_sources()
+    if not epubs and len(txts) == 1:
+        return txts[0].stem
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Tiny CLI: backs ./use and lets run.sh resolve paths (paths come from here).
 # --------------------------------------------------------------------------- #
 def _print_status():
@@ -310,6 +342,9 @@ def _cli(argv):
     pa = sub.add_parser("path", help="print a resolved data path for the active context")
     pa.add_argument("kind")
     pa.add_argument("label", nargs="?")
+    sub.add_parser("default-label",
+                   help="auto chapter label for a single-text book (empty if N/A)")
+    sub.add_parser("book-kind", help="active book source kind: epub | txt | empty")
     args = p.parse_args(argv)
 
     if args.cmd in (None, "status") or (args.cmd == "use" and not args.student):
@@ -323,6 +358,16 @@ def _cli(argv):
         if created:
             print(f"  created empty book folder — drop the .epub into "
                   f"{book_dir(student, book)}/")
+        return 0
+
+    if args.cmd == "default-label":
+        activate()
+        print(default_label() or "")
+        return 0
+
+    if args.cmd == "book-kind":
+        activate()
+        print(book_kind())
         return 0
 
     if args.cmd == "active":

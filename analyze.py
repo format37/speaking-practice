@@ -22,10 +22,57 @@ import re
 import sys
 from difflib import SequenceMatcher
 
+import warnings
+
 import matplotlib
 matplotlib.use("Agg")  # headless: must precede pyplot import
 import matplotlib.pyplot as plt
 import pandas as pd
+
+
+def _available_cjk_fonts():
+    """Installed CJK-capable sans families, in cross-platform preference order."""
+    import matplotlib.font_manager as fm
+    available = {f.name for f in fm.fontManager.ttflist}
+    prefs = [
+        "Noto Sans CJK JP", "Noto Sans CJK SC", "Noto Sans CJK TC",
+        "Noto Sans CJK KR", "Source Han Sans JP", "IPAexGothic", "IPAGothic",
+        "TakaoGothic", "VL Gothic", "Droid Sans Fallback", "WenQuanYi Zen Hei",
+        "Hiragino Sans", "Hiragino Kaku Gothic Pro", "Yu Gothic", "MS Gothic",
+        "Microsoft YaHei", "Heiti SC", "Arial Unicode MS",
+    ]
+    return [f for f in prefs if f in available]
+
+
+def configure_fonts(prefer_cjk=False):
+    """Make chart labels render for the active language.
+
+    matplotlib's default (DejaVu Sans) has no CJK glyphs, so Japanese/Chinese
+    text comes out as tofu boxes and floods the console with "Glyph N missing
+    from font" warnings. Per-glyph fallback to an *appended* CJK font proved
+    unreliable, so for CJK languages we make the CJK font the PRIMARY one (it
+    also covers Latin/Cyrillic). Non-CJK languages keep DejaVu Sans primary —
+    unchanged look — with a CJK font appended as a best-effort fallback. Quiet
+    the cosmetic glyph-missing warning; if a CJK run finds no CJK font, say so.
+    """
+    cjk = _available_cjk_fonts()
+    base = [f for f in plt.rcParams.get("font.sans-serif", []) if f != "DejaVu Sans"]
+    if prefer_cjk and cjk:
+        family = [*cjk, "DejaVu Sans", *base]
+    else:
+        family = ["DejaVu Sans", *base, *cjk]
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = family
+    plt.rcParams["axes.unicode_minus"] = False     # some CJK fonts lack U+2212
+    warnings.filterwarnings("ignore", message="Glyph .* missing from font",
+                            category=UserWarning)
+    if prefer_cjk and not cjk:
+        print("note: no CJK font found — Japanese/Chinese chart labels may not "
+              "render. Install one (e.g. `sudo apt install fonts-noto-cjk`).",
+              file=sys.stderr)
+
+
+configure_fonts()   # sensible default at import; main() refines per language
 
 import config
 import languages
@@ -1371,6 +1418,8 @@ def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     config.activate(args.student, args.book)
     profile = languages.get_profile(args.language or config.LANGUAGE)
+    # CJK (char-unit) languages need a CJK font as the primary face for charts.
+    configure_fonts(prefer_cjk=(profile.unit == "char"))
 
     if args.reference is None and args.chapter is None:
         sys.exit("ERROR: provide a chapter label (or --reference) to locate "

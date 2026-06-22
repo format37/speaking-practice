@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+#
+# Short alias for run.sh — the full extract -> transcribe -> analyze pipeline
+# for the active student/book (set with ./use). Pass a chapter label, or none
+# for a single-text (txt) book read in one pass:
+#
+#   ./run                              # whole-text book, no label needed
+#   ./run "1.1 JUST A BARREL OF MONKEYS"
+#
+# All arguments are forwarded verbatim to run.sh.
+exec "$(dirname "$0")/run.sh" "$@"
