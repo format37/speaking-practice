@@ -1343,9 +1343,11 @@ def parse_args(argv):
     p.add_argument("chapter", nargs="?", default=None,
                    help="chapter label (TOC heading); optional if "
                         "--reference/--transcript/--label are given")
-    p.add_argument("--language", "-l", default=config.DEFAULT_LANGUAGE,
-                   help="analysis language profile (en, generic, ja, ...); "
-                        f"default {config.DEFAULT_LANGUAGE}")
+    p.add_argument("--language", "-l", default=None,
+                   help="analysis language profile (en, generic, ja, ru, ...); "
+                        "default: the active student's config.yaml `language`")
+    p.add_argument("--student", help="override the active student (./use)")
+    p.add_argument("--book", help="override the active book (./use)")
     p.add_argument("--reference", help="override reference .txt path")
     p.add_argument("--transcript", help="override transcript .json path")
     p.add_argument("--label", help="override label for output dirs/progress key")
@@ -1367,7 +1369,8 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
-    profile = languages.get_profile(args.language)
+    config.activate(args.student, args.book)
+    profile = languages.get_profile(args.language or config.LANGUAGE)
 
     if args.reference is None and args.chapter is None:
         sys.exit("ERROR: provide a chapter label (or --reference) to locate "

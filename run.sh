@@ -2,12 +2,15 @@
 #
 # Run the full per-chapter pipeline:  extract -> transcribe -> analyze (--review).
 #
+# It targets the active student/book selected with  ./use <student> <book>  —
+# run  ./use  to see the current selection and the roster.
+#
 # Usage:
 #   ./run.sh "1.1 JUST A BARREL OF MONKEYS"                 # chapter label MUST be quoted
 #   ./run.sh "1.1 JUST A BARREL OF MONKEYS" --review-refresh # extra args pass to analyze.py
 #   FORCE=1 ./run.sh "1.1 ..."                              # re-transcribe even if a transcript exists
 #
-# The recording must already exist at  data/audio/<chapter label>.wav .
+# The recording must already exist at  <active book>/audio/<chapter label>.wav .
 # analyze runs with --review (LLM denoising on your Claude subscription by default).
 set -euo pipefail
 
@@ -17,15 +20,20 @@ PYTHON="${PYTHON:-python}"
 if [ "$#" -lt 1 ] || [ -z "${1:-}" ]; then
     echo "Usage: $0 \"<chapter label>\" [extra analyze flags]" >&2
     echo "       run '$PYTHON extract_chapter.py --list' to see chapter labels" >&2
+    echo "       run './use' to see / change the active student and book" >&2
     exit 2
 fi
 
 chapter="$1"; shift            # remaining args ("$@") are forwarded to analyze.py
 
+# Resolve the active context once; config.py is the single source of paths.
+active="$("$PYTHON" config.py active)"   # tab-separated "student<TAB>book"
+echo "==> student/book: ${active/$'\t'/ / }"
+
 echo "==> [1/3] extract: $chapter"
 "$PYTHON" extract_chapter.py "$chapter"
 
-transcript="data/transcripts/$chapter/$chapter.json"
+transcript="$("$PYTHON" config.py path transcript-json "$chapter")"
 if [ -f "$transcript" ] && [ "${FORCE:-0}" != "1" ]; then
     echo "==> [2/3] transcribe: skipped — transcript exists (set FORCE=1 to redo)"
 else
@@ -36,4 +44,4 @@ fi
 echo "==> [3/3] analyze (--review): $chapter"
 "$PYTHON" analyze.py "$chapter" --review "$@"
 
-echo "==> done — reports in: data/reports/$chapter/"
+echo "==> done — reports in: $("$PYTHON" config.py path report-dir "$chapter")/"

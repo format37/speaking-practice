@@ -187,12 +187,18 @@ def main() -> int:
     )
     parser.add_argument("label", help='Chapter label, e.g. "1.1 JUST A BARREL OF MONKEYS"')
     parser.add_argument("--audio", default=None, help="Override audio path (defaults to config.audio_path(label))")
-    parser.add_argument("-l", "--language", default=config.DEFAULT_LANGUAGE,
-                        help="Language code (default: config.DEFAULT_LANGUAGE)")
+    parser.add_argument("-l", "--language", default=None,
+                        help="Language code (default: the active student's "
+                             "config.yaml `language`)")
+    parser.add_argument("--student", help="Override the active student (./use).")
+    parser.add_argument("--book", help="Override the active book (./use).")
     parser.add_argument("--chunk", action="store_true", help="Force chunked processing")
     args = parser.parse_args()
 
     label = args.label
+    config.activate(args.student, args.book)
+    if not args.language:
+        args.language = config.LANGUAGE
     config.ensure_dirs()
 
     # Validate API key.

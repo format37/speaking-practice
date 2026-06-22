@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#
+# Select / show the active student + book (stored in data/.active and read by
+# config.py). The active selection is what run.sh / extract_chapter.py /
+# transcribe.py / analyze.py target by default.
+#
+# Usage:
+#   ./use                    # show the active context + the roster
+#   ./use <student>          # switch student (auto-picks the book if it has one)
+#   ./use <student> <book>   # switch student + book (creates the folder if new)
+#
+# Students are the sub-dirs of data/ that contain a config.yaml (with a
+# `language:` line). Book is a folder name under data/<student>/.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+PYTHON="${PYTHON:-python}"
+
+if [ "$#" -eq 0 ]; then
+    exec "$PYTHON" config.py status
+fi
+exec "$PYTHON" config.py use "$@"

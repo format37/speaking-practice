@@ -2,14 +2,16 @@
 
 Reads the table of contents to map a human-readable chapter label
 (e.g. "1.1 JUST A BARREL OF MONKEYS") to its XHTML document, then writes the
-chapter as plain text to data/book/chapters/<label>.txt with the title as the
-first line followed by the prose body. analyze.py's load_reference() treats the
-first non-empty line as the title (dropped from scoring) and the rest as body.
+chapter as plain text to the active book's chapters/<label>.txt with the title
+as the first line followed by the prose body. analyze.py's load_reference()
+treats the first non-empty line as the title (dropped from scoring) and the
+rest as body. The source epub is the (single) *.epub in the active book folder.
 
 Usage:
     python extract_chapter.py "1.1 JUST A BARREL OF MONKEYS"
     python extract_chapter.py --list        # print every chapter label
     python extract_chapter.py --all         # extract every chapter
+    # --student/--book override the active ./use selection for one run.
 """
 import argparse
 import sys
@@ -80,7 +82,7 @@ def extract_body(book, href):
 
 
 def write_chapter(label, title, body):
-    """Write the chapter text to data/book/chapters/<label>.txt."""
+    """Write the chapter text to the active book's chapters/<label>.txt."""
     config.ensure_dirs()
     out = config.chapter_txt(label)
     header = title.strip() or label
@@ -111,10 +113,16 @@ def main():
     parser.add_argument("--all", action="store_true",
                         help="Extract every chapter in the TOC.")
     parser.add_argument("--epub", help="Override the source epub path.")
+    parser.add_argument("--student", help="Override the active student (./use).")
+    parser.add_argument("--book", help="Override the active book (./use).")
     args = parser.parse_args()
 
+    # An explicit --epub lets `--list` run without an active book; everything
+    # that writes into the book folder needs the active (student, book) context.
+    config.activate(args.student, args.book, require=args.epub is None)
+
     epub_path = Path(args.epub) if args.epub else config.DEFAULT_EPUB
-    if not epub_path.exists():
+    if epub_path is None or not epub_path.exists():
         sys.exit(f"ERROR: epub not found: {epub_path}")
 
     book = epub.read_epub(str(epub_path))

@@ -2,6 +2,7 @@
 # install it via your OS package manager (e.g. apt install ffmpeg) — not pip.
 deepgram-sdk==5.3.0
 python-dotenv
+pyyaml            # student config.yaml + the active-selection pointer (config.py)
 pandas
 matplotlib
 ebooklib          # epub parsing (extract_chapter.py)
